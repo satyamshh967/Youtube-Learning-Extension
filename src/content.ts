@@ -1,18 +1,25 @@
-function getYouTubeVideoId(): string | null {
+interface VideoInfo {
+  id: string | null;
+  title: string;
+  isYouTubeVideo: boolean;
+}
+
+function getVideoInfo(): VideoInfo {
   const url = new URL(window.location.href);
+  const videoId =
+    url.pathname === "/watch"
+      ? url.searchParams.get("v")
+      : null;
 
-  return url.searchParams.get("v");
+  return {
+    id: videoId,
+    title: document.title.replace(" - YouTube", "").trim(),
+    isYouTubeVideo: Boolean(videoId),
+  };
 }
 
-function getYouTubeVideoTitle(): string {
-  return document.title.replace(" - YouTube", "").trim();
-}
-
-const videoId = getYouTubeVideoId();
-const title = getYouTubeVideoTitle();
-
-if (videoId) {
-  console.log("YouTube Learning Companion");
-  console.log("Video ID:", videoId);
-  console.log("Video title:", title);
-}
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === "GET_VIDEO_INFO") {
+    sendResponse(getVideoInfo());
+  }
+});

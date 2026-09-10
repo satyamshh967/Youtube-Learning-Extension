@@ -6,9 +6,10 @@
   "action": {
     "default_popup": "index.html"
   },
+  "permissions": [],
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/watch?v=*"],
+      "matches": ["https://www.youtube.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
