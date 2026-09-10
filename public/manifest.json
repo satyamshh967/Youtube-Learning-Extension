@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Learning Companion",
+  "version": "0.1.0",
+  "description": "Turn YouTube educational videos into an interactive learning experience.",
+  "action": {
+    "default_popup": "index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/watch?v=*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
