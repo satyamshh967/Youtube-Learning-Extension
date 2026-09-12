@@ -19,6 +19,15 @@
   "action": {
     "default_title": "YouTube Learning Companion"
   },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+Y",
+        "mac": "Alt+Shift+Y"
+      },
+      "description": "Activate extension on current YouTube tab"
+    }
+  },
   "side_panel": {
     "default_path": "index.html"
   },

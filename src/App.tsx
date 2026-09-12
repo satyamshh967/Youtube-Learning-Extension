@@ -4,23 +4,12 @@ import {
   useState,
 } from "react";
 import "./App.css";
-
-interface VideoInfo {
-  id: string | null;
-  title: string;
-  url: string;
-}
-
-interface TranscriptSegment {
-  start: number;
-  timestamp: string;
-  text: string;
-}
-
-interface Transcript {
-  videoId: string;
-  segments: TranscriptSegment[];
-}
+import type {
+  VideoInfo,
+  Transcript,
+  TranscriptSegment,
+  TranscriptionStatus,
+} from "./types/transcript";
 
 interface ActiveContext {
   tabId: number | null;
@@ -32,706 +21,860 @@ interface BackgroundResponse {
   context: ActiveContext;
 }
 
-interface RuntimeMessage {
-  type?: string;
-  context?: ActiveContext;
-  transcript?: {
-    segments?: Array<{
-      start: number;
-      end?: number;
-      text: string;
-    }>;
-  };
-  error?: string;
-}
-
-type TranscriptionState =
-  | "idle"
-  | "capturing"
-  | "processing";
-
-function formatTimestamp(
-  seconds: number,
-): string {
-  const totalSeconds = Math.max(
-    0,
-    Math.floor(seconds),
-  );
-
-  const hours = Math.floor(
-    totalSeconds / 3600,
-  );
-
-  const minutes = Math.floor(
-    (totalSeconds % 3600) / 60,
-  );
-
-  const remainingSeconds =
-    totalSeconds % 60;
+function formatTimestamp(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
 
   if (hours > 0) {
-    return `${hours}:${String(
-      minutes,
-    ).padStart(2, "0")}:${String(
-      remainingSeconds,
-    ).padStart(2, "0")}`;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(
+      2,
+      "0",
+    )}:${String(remainingSeconds).padStart(2, "0")}`;
   }
 
-  return `${minutes}:${String(
+  return `${String(minutes).padStart(2, "0")}:${String(
     remainingSeconds,
   ).padStart(2, "0")}`;
 }
 
+function formatTimestampRange(start: number, end?: number): string {
+  const startStr = formatTimestamp(start);
+  if (end !== undefined && end > start) {
+    return `[${startStr} - ${formatTimestamp(end)}]`;
+  }
+  return `[${startStr}]`;
+}
+
 function App() {
-  const [video, setVideo] =
-    useState<VideoInfo | null>(null);
-
-  const [transcript, setTranscript] =
-    useState<Transcript | null>(null);
-
-  const [loading, setLoading] =
-    useState(false);
-
-  const [error, setError] =
-    useState<string | null>(null);
-
+  const [video, setVideo] = useState<VideoInfo | null>(null);
+  const [transcript, setTranscript] = useState<Transcript | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [transcriptionState, setTranscriptionState] =
-    useState<TranscriptionState>(
-      "idle",
-    );
+    useState<TranscriptionStatus>("idle");
+  const [capturedAudioDuration, setCapturedAudioDuration] = useState<number>(0);
+  const [capturedBytes, setCapturedBytes] = useState<number>(0);
+  const [processingStage, setProcessingStage] = useState<string>("");
 
-  const restoreTranscript =
-    useCallback(
-      async (
-        videoId: string,
-      ) => {
-        try {
-          const key =
-            `transcript:${videoId}`;
+  const restoreTranscript = useCallback(async (videoId: string) => {
+    try {
+      const key = `transcript:${videoId}`;
+      const result = await chrome.storage.local.get(key);
+      const cached = result[key] as Transcript | undefined;
 
-          const result =
-            await chrome.storage.local.get(
-              key,
-            );
+      if (
+        cached &&
+        cached.videoId === videoId &&
+        Array.isArray(cached.segments) &&
+        cached.segments.length > 0
+      ) {
+        setTranscript(cached);
+        return;
+      }
 
-          const cached =
-            result[key] as
-              | Transcript
-              | undefined;
+      setTranscript(null);
+    } catch {
+      setTranscript(null);
+    }
+  }, []);
 
-          if (
-            cached &&
-            cached.videoId ===
-              videoId &&
-            Array.isArray(
-              cached.segments,
-            ) &&
-            cached.segments.length > 0
-          ) {
-            setTranscript(cached);
-            return;
-          }
+  const applyContext = useCallback(
+    async (context: ActiveContext) => {
+      const nextVideo = context.video;
 
-          setTranscript(null);
-        } catch {
-          setTranscript(null);
-        }
-      },
-      [],
-    );
-
-  const applyContext =
-    useCallback(
-      async (
-        context: ActiveContext,
-      ) => {
-        const nextVideo =
-          context.video;
-
-        if (!nextVideo?.id) {
-          setVideo(null);
-          setTranscript(null);
-          setError(null);
-          setLoading(false);
-          setTranscriptionState(
-            "idle",
-          );
-          return;
-        }
-
-        setVideo(nextVideo);
-
-        if (
-          transcript?.videoId !==
-          nextVideo.id
-        ) {
-          setTranscript(null);
-        }
-
-        if (
-          transcriptionState ===
-          "idle"
-        ) {
-          setLoading(false);
-        }
-
-        setError(null);
-
-        await restoreTranscript(
-          nextVideo.id,
-        );
-      },
-      [
-        restoreTranscript,
-        transcriptionState,
-        transcript?.videoId,
-      ],
-    );
-
-  const loadActiveContext =
-    useCallback(async () => {
-      try {
-        const response =
-          (await chrome.runtime.sendMessage(
-            {
-              type:
-                "GET_ACTIVE_CONTEXT",
-            },
-          )) as BackgroundResponse;
-
-        if (
-          response?.success &&
-          response.context
-        ) {
-          await applyContext(
-            response.context,
-          );
-        }
-      } catch {
+      if (!nextVideo?.id) {
         setVideo(null);
         setTranscript(null);
         setError(null);
+        setLoading(false);
+        setTranscriptionState("idle");
+        setCapturedAudioDuration(0);
+        setCapturedBytes(0);
+        return;
       }
-    }, [applyContext]);
 
-  const startTranscription =
-  async () => {
+      const isDifferentVideo = video?.id !== nextVideo.id;
+      setVideo(nextVideo);
+
+      if (isDifferentVideo) {
+        setError(null);
+        setTranscript(null);
+        setTranscriptionState("idle");
+        setLoading(false);
+        setCapturedAudioDuration(0);
+        setCapturedBytes(0);
+      }
+
+      if (transcript?.videoId !== nextVideo.id) {
+        setTranscript(null);
+      }
+
+      await restoreTranscript(nextVideo.id);
+    },
+    [restoreTranscript, transcript?.videoId, video?.id],
+  );
+
+  const loadActiveContext = useCallback(async () => {
+    try {
+      const response = (await chrome.runtime.sendMessage({
+        type: "GET_ACTIVE_CONTEXT",
+      })) as BackgroundResponse;
+
+      if (response?.success && response.context) {
+        await applyContext(response.context);
+      }
+    } catch {
+      setVideo(null);
+      setTranscript(null);
+    }
+  }, [applyContext]);
+
+  const startTranscription = async (mode: "auto" | "audio" = "auto") => {
     if (!video?.id) {
+      return;
+    }
+
+    if (
+      transcriptionState === "capturing" ||
+      transcriptionState === "transcribing" ||
+      transcriptionState === "finalizing"
+    ) {
       return;
     }
 
     setError(null);
     setLoading(true);
+    setTranscriptionState("detecting_video");
+    setCapturedAudioDuration(0);
+    setCapturedBytes(0);
 
     try {
-      const tabs =
-        await chrome.tabs.query({
-          active: true,
-          currentWindow: true,
-        });
-
-      const activeTab =
-        tabs[0];
-
-      if (!activeTab?.id) {
-        throw new Error(
-          "No active YouTube tab found.",
-        );
-      }
-
-      const currentUrl =
-        activeTab.url ?? "";
-
-      if (
-        !currentUrl.includes(
-          "youtube.com/watch",
-        )
-      ) {
-        throw new Error(
-          "The active tab is not a YouTube video.",
-        );
-      }
-
-      const streamId =
-        await chrome.tabCapture.getMediaStreamId(
-          {
-            targetTabId:
-              activeTab.id,
-          },
-        );
-
-      if (!streamId) {
-        throw new Error(
-          "Chrome did not provide an audio capture stream.",
-        );
-      }
-
-      const response =
-        (await chrome.runtime.sendMessage(
-          {
-            type:
-              "START_AUDIO_CAPTURE",
-            streamId,
-            tabId:
-              activeTab.id,
-          },
-        )) as {
-          success?: boolean;
-          error?: string;
-        };
+      setTranscriptionState("preparing");
+      const response = (await chrome.runtime.sendMessage({
+        type: "START_TRANSCRIPTION",
+        mode,
+      })) as {
+        success?: boolean;
+        error?: string;
+        method?: string;
+        isPaused?: boolean;
+      };
 
       if (!response?.success) {
         throw new Error(
-          response?.error ??
-            "The audio recorder could not start.",
+          response?.error ?? "Failed to start transcription process.",
         );
       }
 
-      setTranscriptionState(
-        "capturing",
-      );
+      if (response.method === "captions") {
+        setTranscriptionState("finalizing");
+        setLoading(false);
+        return;
+      }
 
+      // Audio capture mode started
+      setTranscriptionState(response.isPaused ? "paused" : "capturing");
       setLoading(false);
-    } catch (error) {
+    } catch (err) {
       setLoading(false);
-      setTranscriptionState(
-        "idle",
-      );
-
+      setTranscriptionState("failed");
       setError(
-        error instanceof Error
-          ? error.message
-          : "Could not start transcription.",
+        err instanceof Error ? err.message : "Could not start transcription.",
       );
     }
-  };setLoading(true);
-      setError(null);
+  };
 
-      try {
-        const response =
-          (await chrome.runtime.sendMessage(
-            {
-              type:
-                "STOP_TRANSCRIPTION",
-            },
-          )) as {
-            success?: boolean;
-            error?: string;
-          };
+  const stopTranscription = async () => {
+    setLoading(true);
+    setTranscriptionState("transcribing");
+    setProcessingStage("Processing audio with local Whisper engine...");
 
-        if (!response?.success) {
-          throw new Error(
-            response?.error ??
-              "Could not stop transcription.",
-          );
-        }
-      } catch (error) {
-        setLoading(false);
+    try {
+      const response = (await chrome.runtime.sendMessage({
+        type: "STOP_TRANSCRIPTION",
+      })) as { success?: boolean; error?: string };
 
-        setError(
-          error instanceof Error
-            ? error.message
-            : "Could not stop transcription.",
+      if (!response?.success) {
+        throw new Error(
+          response?.error ?? "Failed to stop audio transcription.",
         );
       }
-    };
+    } catch (err) {
+      setLoading(false);
+      setTranscriptionState("failed");
+      setError(
+        err instanceof Error ? err.message : "Could not stop transcription.",
+      );
+    }
+  };
 
-  const seekTo =
-    async (time: number) => {
-      try {
-        const response =
-          (await chrome.runtime.sendMessage(
-            {
-              type:
-                "GET_ACTIVE_CONTEXT",
-            },
-          )) as BackgroundResponse;
+  const playVideoOnTab = async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: "PLAY_VIDEO" });
+      setTranscriptionState("capturing");
+    } catch {
+      // Ignore
+    }
+  };
 
-        if (
-          !response?.success ||
-          !response.context
-        ) {
-          return;
-        }
+  const pauseVideoOnTab = async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: "PAUSE_VIDEO" });
+      setTranscriptionState("paused");
+    } catch {
+      // Ignore
+    }
+  };
 
-        const tabId =
-          response.context.tabId;
+  const cancelTranscription = async () => {
+    try {
+      await chrome.runtime.sendMessage({
+        type: "CANCEL_TRANSCRIPTION",
+      });
+    } catch {
+      // Ignore
+    } finally {
+      setTranscriptionState("cancelled");
+      setLoading(false);
+      setCapturedAudioDuration(0);
+      setCapturedBytes(0);
+      setProcessingStage("");
+      setTimeout(() => {
+        setTranscriptionState("idle");
+      }, 1000);
+    }
+  };
 
-        const currentVideo =
-          response.context.video;
+  const seekTo = async (time: number) => {
+    try {
+      const response = (await chrome.runtime.sendMessage({
+        type: "GET_ACTIVE_CONTEXT",
+      })) as BackgroundResponse;
 
-        if (
-          !tabId ||
-          !currentVideo?.id ||
-          currentVideo.id !==
-            video?.id
-        ) {
-          await applyContext(
-            response.context,
-          );
-          return;
-        }
-
-        await chrome.tabs.sendMessage(
-          tabId,
-          {
-            type: "SEEK_VIDEO",
-            time,
-          },
-        );
-      } catch {
-        setError(
-          "Could not communicate with the YouTube page.",
-        );
+      if (!response?.success || !response.context) {
+        return;
       }
-    };
+
+      const tabId = response.context.tabId;
+      const currentVideo = response.context.video;
+
+      if (!tabId || !currentVideo?.id || currentVideo.id !== video?.id) {
+        await applyContext(response.context);
+        return;
+      }
+
+      await chrome.tabs.sendMessage(tabId, {
+        type: "SEEK_VIDEO",
+        time,
+      });
+    } catch {
+      setError("Could not seek video. Please verify the YouTube tab is active.");
+    }
+  };
+
+  const copyTranscriptToClipboard = () => {
+    if (!transcript) return;
+    const text = transcript.segments
+      .map((s) => `${formatTimestampRange(s.start, s.end)} ${s.text}`)
+      .join("\n");
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const downloadTranscript = () => {
+    if (!transcript) return;
+    const title = video?.title || "youtube-transcript";
+    const text = [
+      `Title: ${title}`,
+      `Video ID: ${transcript.videoId}`,
+      `Source: ${transcript.source || "Transcription"}`,
+      `Language: ${transcript.language || "auto"}`,
+      "",
+      ...transcript.segments.map(
+        (s) => `${formatTimestampRange(s.start, s.end)} ${s.text}`,
+      ),
+    ].join("\n");
+
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_transcript.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   useEffect(() => {
     loadActiveContext();
 
-    const listener = (
-      message: RuntimeMessage,
-    ) => {
-      if (
-        message.type ===
-          "ACTIVE_CONTEXT_UPDATED" &&
-        message.context
-      ) {
-        applyContext(
-          message.context,
-        );
-
+    const listener = (message: any) => {
+      if (message?.type === "ACTIVE_CONTEXT_UPDATED" && message.context) {
+        applyContext(message.context);
         return;
       }
 
-      if (
-        message.type ===
-        "TRANSCRIPTION_PROCESSING"
-      ) {
+      if (message?.type === "PLAYBACK_STATE_CHANGED") {
+        setVideo((prev) =>
+          prev
+            ? {
+                ...prev,
+                isPaused: message.isPaused,
+                currentTime: message.currentTime,
+                duration: message.duration ?? prev.duration,
+              }
+            : prev,
+        );
+
+        if (transcriptionState === "capturing" && message.isPaused) {
+          setTranscriptionState("paused");
+        } else if (transcriptionState === "paused" && !message.isPaused) {
+          setTranscriptionState("capturing");
+        }
+        return;
+      }
+
+      if (message?.type === "TRANSCRIPTION_STARTED") {
         setLoading(true);
+        setTranscriptionState("preparing");
         setError(null);
-        setTranscriptionState(
-          "processing",
-        );
+        return;
+      }
 
+      if (message?.type === "AUDIO_CAPTURE_STARTED") {
+        setLoading(false);
+        setTranscriptionState("capturing");
+        setError(null);
+        return;
+      }
+
+      if (message?.type === "AUDIO_CAPTURE_PROGRESS") {
+        const seconds = Math.round((message.durationMs ?? 0) / 1000);
+        setCapturedAudioDuration(seconds);
+        setCapturedBytes(message.bytes ?? 0);
+        if (transcriptionState !== "paused") {
+          setTranscriptionState("capturing");
+        }
+        return;
+      }
+
+      if (message?.type === "TRANSCRIPTION_PAUSED") {
+        setTranscriptionState("paused");
+        return;
+      }
+
+      if (message?.type === "TRANSCRIPTION_RESUMED") {
+        setTranscriptionState("capturing");
+        return;
+      }
+
+      if (message?.type === "TRANSCRIPTION_PROGRESS") {
+        setLoading(true);
+        setTranscriptionState("transcribing");
+        if (message.stage === "sending") {
+          setProcessingStage("Sending recorded audio to Whisper server...");
+        } else if (message.stage === "parsing") {
+          setProcessingStage("Transcribing speech with Whisper neural model...");
+        }
         return;
       }
 
       if (
-        message.type ===
-          "TRANSCRIPTION_COMPLETE" &&
+        (message?.type === "TRANSCRIPTION_COMPLETED" ||
+          message?.type === "TRANSCRIPTION_COMPLETE") &&
         message.transcript
       ) {
-        const currentVideo =
-          video;
-
-        if (
-          !currentVideo?.id ||
-          !message.transcript
-            .segments
-        ) {
+        if (!video?.id || !message.transcript.segments) {
           setLoading(false);
-          setTranscriptionState(
-            "idle",
-          );
+          setTranscriptionState("idle");
           return;
         }
 
-        const nextTranscript: Transcript =
-          {
-            videoId:
-              currentVideo.id,
-            segments:
-              message.transcript.segments
-                .filter(
-                  (
-                    segment,
-                  ) =>
-                    Number.isFinite(
-                      segment.start,
-                    ) &&
-                    segment.text.trim()
-                      .length > 0,
-                )
-                .map(
-                  (
-                    segment,
-                  ) => ({
-                    start:
-                      segment.start,
-                    timestamp:
-                      formatTimestamp(
-                        segment.start,
-                      ),
-                    text:
-                      segment.text
-                        .replace(
-                          /\s+/g,
-                          " ",
-                        )
-                        .trim(),
-                  }),
-                ),
-          };
+        const rawSegments = message.transcript.segments as Array<{
+          start: number;
+          end?: number;
+          text: string;
+        }>;
 
-        setTranscript(
-          nextTranscript,
-        );
+        const nextTranscript: Transcript = {
+          videoId: video.id,
+          title: video.title,
+          language: message.transcript.language,
+          languageProbability: message.transcript.languageProbability,
+          source: message.transcript.source || "youtube_captions",
+          duration: video.duration,
+          segments: rawSegments
+            .filter(
+              (segment) =>
+                Number.isFinite(segment.start) &&
+                segment.text &&
+                segment.text.trim().length > 0,
+            )
+            .map((segment) => ({
+              start: segment.start,
+              end: segment.end,
+              timestamp: formatTimestamp(segment.start),
+              endTimestamp:
+                segment.end !== undefined
+                  ? formatTimestamp(segment.end)
+                  : undefined,
+              text: segment.text.replace(/\s+/g, " ").trim(),
+            })),
+        };
+
+        setTranscript(nextTranscript);
 
         chrome.storage.local
           .set({
-            [`transcript:${currentVideo.id}`]:
-              nextTranscript,
+            [`transcript:${video.id}`]: nextTranscript,
           })
           .catch(() => {});
 
         setLoading(false);
         setError(null);
-        setTranscriptionState(
-          "idle",
-        );
+        setTranscriptionState("completed");
+        setProcessingStage("");
+
+        setTimeout(() => {
+          setTranscriptionState("idle");
+        }, 1500);
 
         return;
       }
 
       if (
-        message.type ===
-        "TRANSCRIPTION_ERROR"
+        message?.type === "TRANSCRIPTION_FAILED" ||
+        message?.type === "TRANSCRIPTION_ERROR"
       ) {
-        setError(
-          message.error ??
-            "Transcription failed.",
-        );
-
+        setError(message.error ?? "Transcription process failed.");
         setLoading(false);
-        setTranscriptionState(
-          "idle",
-        );
+        setTranscriptionState("failed");
+        setProcessingStage("");
+        return;
+      }
+
+      if (message?.type === "TRANSCRIPTION_CANCELLED") {
+        setTranscriptionState("cancelled");
+        setLoading(false);
+        setCapturedAudioDuration(0);
+        setCapturedBytes(0);
+        setProcessingStage("");
+        setTimeout(() => {
+          setTranscriptionState("idle");
+        }, 1200);
+        return;
       }
     };
 
-    chrome.runtime.onMessage.addListener(
-      listener,
-    );
+    chrome.runtime.onMessage.addListener(listener);
 
     return () => {
-      chrome.runtime.onMessage.removeListener(
-        listener,
-      );
+      chrome.runtime.onMessage.removeListener(listener);
     };
-  }, [
-    applyContext,
-    loadActiveContext,
-    video,
-  ]);
+  }, [applyContext, loadActiveContext, transcriptionState, video]);
+
+  const hasFiniteDuration =
+    typeof video?.duration === "number" && video.duration > 0;
 
   return (
     <div className="app">
       <header className="header">
         <div>
-          <div className="eyebrow">
-            LEARNING COMPANION
-          </div>
-
-          <h1>
-            YouTube Companion
-          </h1>
+          <div className="eyebrow">LEARNING COMPANION</div>
+          <h1>YouTube Companion</h1>
         </div>
-
-        <span className="status-dot" />
+        <span
+          className={`status-dot ${
+            transcriptionState === "capturing"
+              ? "status-dot-capturing"
+              : transcriptionState === "transcribing" ||
+                transcriptionState === "preparing" ||
+                transcriptionState === "detecting_video" ||
+                transcriptionState === "finalizing"
+                ? "status-dot-processing"
+                : transcriptionState === "paused"
+                  ? "status-dot-paused"
+                  : ""
+          }`}
+          title={`Status: ${transcriptionState}`}
+        />
       </header>
 
       <main className="content">
         {!video ? (
           <section className="home">
-            <div className="home-icon">
-              ▶
-            </div>
-
-            <div className="eyebrow">
-              YOUR LEARNING SPACE
-            </div>
-
+            <div className="home-icon">▶</div>
+            <div className="eyebrow">YOUR LEARNING SPACE</div>
             <h2>
               Learn from
               <br />
               any video.
             </h2>
-
             <p>
-              Open a YouTube
-              educational video and
-              turn it into an
-              interactive learning
-              experience.
+              Open any YouTube educational video to generate full transcripts,
+              summaries, and jump to any topic.
             </p>
 
             <div className="feature-list">
               <div className="feature">
                 <span>01</span>
-
                 <div>
-                  <strong>
-                    Smart transcripts
-                  </strong>
-
+                  <strong>Instant complete transcripts</strong>
                   <small>
-                    Read and navigate
-                    every part of a
-                    video.
+                    Extracts full video text even when paused or fast-forwarded.
                   </small>
                 </div>
               </div>
-
               <div className="feature">
                 <span>02</span>
-
                 <div>
-                  <strong>
-                    AI-powered learning
-                  </strong>
-
-                  <small>
-                    Summaries, chapters,
-                    notes and questions.
-                  </small>
+                  <strong>Clickable timestamps</strong>
+                  <small>Jump directly to relevant parts of the video.</small>
                 </div>
               </div>
-
               <div className="feature">
                 <span>03</span>
-
                 <div>
-                  <strong>
-                    Build your knowledge
-                  </strong>
-
+                  <strong>Local Whisper AI fallback</strong>
                   <small>
-                    Save what you learn
-                    and revisit it later.
+                    High-accuracy speech-to-text for videos without captions.
                   </small>
                 </div>
               </div>
             </div>
 
-            <div className="home-hint">
-              Open a YouTube video to
-              get started.
-            </div>
+            <div className="home-hint">Open a YouTube video to get started.</div>
           </section>
         ) : (
           <>
             <section className="video-card">
-              <div className="label">
-                CURRENT VIDEO
+              <div className="video-card-top">
+                <div className="label">CURRENT VIDEO</div>
+                {hasFiniteDuration && (
+                  <span className="duration-pill">
+                    ⏱ {formatTimestamp(video.duration!)}
+                  </span>
+                )}
               </div>
 
-              <h2>
-                {video.title}
-              </h2>
+              <h2>{video.title}</h2>
 
-              <div className="video-id">
-                {video.id}
+              <div className="video-meta-row">
+                <span className="video-id">{video.id}</span>
+                <span className="playback-pill">
+                  {video.isPaused ? "⏸ Paused" : "▶ Playing"}
+                </span>
+                {video.hasCaptions !== undefined && (
+                  <span
+                    className={`caption-pill ${video.hasCaptions ? "has-caps" : "no-caps"}`}
+                  >
+                    {video.hasCaptions ? "CC Available" : "No CC (Audio AI)"}
+                  </span>
+                )}
               </div>
             </section>
 
             <section className="section">
               <div className="section-header">
                 <div>
-                  <div className="label">
-                    TRANSCRIPT
-                  </div>
-
+                  <div className="label">TRANSCRIPT</div>
                   <h2>
                     {transcript
                       ? `${transcript.segments.length} segments`
-                      : "Video Transcript"}
+                      : "Full Video Transcript"}
                   </h2>
                 </div>
 
                 {!transcript && (
-                  <button
-                    className="primary-button"
-                    onClick={
-                      transcriptionState ===
-                      "capturing"
-                        ? stopTranscription
-                        : startTranscription
-                    }
-                    disabled={
-                      loading
-                    }
-                  >
-                    {transcriptionState ===
-                    "capturing"
-                      ? "Stop & Transcribe"
-                      : transcriptionState ===
-                          "processing"
-                        ? "Transcribing..."
-                        : loading
-                          ? "Starting..."
-                          : "Load Transcript"}
-                  </button>
+                  <div className="button-group">
+                    {transcriptionState === "capturing" ||
+                    transcriptionState === "paused" ? (
+                      <>
+                        <button
+                          className="primary-button danger-button"
+                          onClick={stopTranscription}
+                          disabled={loading}
+                        >
+                          Stop & Transcribe
+                        </button>
+                        {transcriptionState === "capturing" ? (
+                          <button
+                            className="secondary-button"
+                            onClick={pauseVideoOnTab}
+                            title="Pause video playback and audio capture"
+                          >
+                            Pause
+                          </button>
+                        ) : (
+                          <button
+                            className="secondary-button"
+                            onClick={playVideoOnTab}
+                            title="Resume video playback and audio capture"
+                          >
+                            Play & Resume
+                          </button>
+                        )}
+                        <button
+                          className="secondary-button"
+                          onClick={cancelTranscription}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          className="primary-button"
+                          onClick={() => startTranscription("auto")}
+                          disabled={loading}
+                          title="Generate complete transcript (instant from captions, or via Whisper)"
+                        >
+                          {transcriptionState === "detecting_video"
+                            ? "Detecting..."
+                            : transcriptionState === "preparing"
+                              ? "Preparing..."
+                              : transcriptionState === "transcribing"
+                                ? "Transcribing..."
+                                : transcriptionState === "finalizing"
+                                  ? "Finalizing..."
+                                  : loading
+                                    ? "Starting..."
+                                    : "Start Transcription"}
+                        </button>
+
+                        <button
+                          className="secondary-button"
+                          onClick={() => startTranscription("audio")}
+                          disabled={loading}
+                          title="Force audio capture and transcription via local Whisper"
+                        >
+                          Record Audio
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {transcript && (
+                  <div className="button-group">
+                    <button
+                      className="secondary-button"
+                      onClick={copyTranscriptToClipboard}
+                      title="Copy entire transcript to clipboard"
+                    >
+                      {copied ? "✓ Copied" : "Copy"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      onClick={downloadTranscript}
+                      title="Download transcript as text file"
+                    >
+                      Download
+                    </button>
+                    <button
+                      className="secondary-button"
+                      onClick={() => setTranscript(null)}
+                      title="Clear transcript to re-run or inspect again"
+                    >
+                      Clear
+                    </button>
+                  </div>
                 )}
               </div>
 
-              {transcriptionState ===
-                "capturing" && (
-                <div className="error">
-                  Recording the video
-                  audio. Click
-                  <strong>
-                    {" "}
-                    Stop & Transcribe
-                  </strong>{" "}
-                  when ready.
+              {/* Status & Guidance Boxes */}
+              {transcriptionState === "detecting_video" && (
+                <div className="info-box processing-box">
+                  <div className="spinner" />
+                  <div>
+                    <strong>Detecting YouTube Video...</strong>
+                    <p>
+                      Reading video details and verifying transcript
+                      availability.
+                    </p>
+                  </div>
                 </div>
               )}
 
-              {transcriptionState ===
-                "processing" && (
-                <div className="error">
-                  Transcribing audio with
-                  the local Whisper server.
+              {transcriptionState === "preparing" && (
+                <div className="info-box processing-box">
+                  <div className="spinner" />
+                  <div>
+                    <strong>Preparing Full Transcript...</strong>
+                    <p>
+                      Checking complete YouTube transcript tracks from 00:00 to{" "}
+                      {hasFiniteDuration
+                        ? formatTimestamp(video.duration!)
+                        : "end"}
+                      . Works even when video is paused.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {transcriptionState === "capturing" && (
+                <div className="info-box capturing-box">
+                  <div className="pulse-indicator" />
+                  <div>
+                    <strong>Live Audio Capture in Progress</strong>
+                    <p className="capture-timer">
+                      Captured:{" "}
+                      <strong>{formatTimestamp(capturedAudioDuration)}</strong>{" "}
+                      {hasFiniteDuration && (
+                        <span> / {formatTimestamp(video.duration!)}</span>
+                      )}{" "}
+                      ({Math.round(capturedBytes / 1024)} KB)
+                    </p>
+                    <p className="capture-hint">
+                      Audio is recording from the playing video. Click{" "}
+                      <strong>Stop & Transcribe</strong> when finished.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {transcriptionState === "paused" && (
+                <div className="info-box paused-box">
+                  <div className="pause-icon">⏸</div>
+                  <div>
+                    <strong>Video is Paused</strong>
+                    <p>
+                      {capturedAudioDuration > 0
+                        ? `Capture paused at ${formatTimestamp(capturedAudioDuration)}. Live capture requires video playback.`
+                        : "Live audio capture cannot record while the video is paused. Click Play on YouTube or use the button below."}
+                    </p>
+                    <div className="box-action-row">
+                      <button
+                        className="primary-button small-button"
+                        onClick={playVideoOnTab}
+                      >
+                        ▶ Play Video & Record
+                      </button>
+                      {capturedAudioDuration > 0 && (
+                        <button
+                          className="secondary-button small-button"
+                          onClick={stopTranscription}
+                        >
+                          Transcribe Captured Audio Now
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {transcriptionState === "transcribing" && (
+                <div className="info-box processing-box">
+                  <div className="spinner" />
+                  <div>
+                    <strong>Transcribing Audio with Whisper</strong>
+                    <p>
+                      {processingStage ||
+                        "Processing audio through local neural model..."}
+                    </p>
+                    <small className="honest-hint">
+                      This processes the complete recorded audio without faking
+                      progress.
+                    </small>
+                  </div>
+                </div>
+              )}
+
+              {transcriptionState === "finalizing" && (
+                <div className="info-box success-box">
+                  <div className="spinner" />
+                  <div>
+                    <strong>Finalizing Complete Transcript...</strong>
+                    <p>
+                      Organizing timestamped segments from beginning to end.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {transcriptionState === "completed" && (
+                <div className="info-box success-box">
+                  ✓ Full transcript successfully loaded!
+                </div>
+              )}
+
+              {transcriptionState === "cancelled" && (
+                <div className="info-box cancelled-box">
+                  Transcription was cancelled.
                 </div>
               )}
 
               {error && (
                 <div className="error">
-                  {error}
+                  <div className="error-title">Transcription Notice / Error:</div>
+                  <div>{error}</div>
+
+                  {error.includes("activeTab") ||
+                  error.includes("invoked") ||
+                  error.includes("permission") ? (
+                    <div className="error-help">
+                      <strong>How to grant permission:</strong>
+                      <br />
+                      1. Click the <strong>extension icon</strong> in your
+                      Chrome toolbar (or press <code>Alt+Shift+Y</code>).
+                      <br />
+                      2. Ensure the YouTube video is open in your tab.
+                      <br />
+                      3. Click <strong>Start Transcription</strong> again.
+                    </div>
+                  ) : error.includes("Failed to fetch") ||
+                    error.includes("server") ||
+                    error.includes("8000") ? (
+                    <div className="error-help">
+                      <strong>Whisper Server Notice:</strong>
+                      <br />
+                      If capturing audio, make sure the local server is running:
+                      <br />
+                      <code>cd transcriber && uvicorn server:app --reload</code>
+                    </div>
+                  ) : null}
                 </div>
               )}
 
+              {/* Transcript Display */}
               {transcript && (
                 <div className="transcript">
-                  {transcript.segments.map(
-                    (
-                      segment,
-                      index,
-                    ) => (
-                      <button
-                        className="segment"
-                        key={`${segment.start}-${index}`}
-                        onClick={() =>
-                          seekTo(
-                            segment.start,
-                          )
-                        }
-                      >
-                        <span className="timestamp">
-                          {
-                            segment.timestamp
-                          }
-                        </span>
+                  <div className="transcript-metadata">
+                    <span className="source-tag">
+                      {transcript.source === "youtube_captions"
+                        ? "★ YouTube Captions (Full Video)"
+                        : "⚡ Whisper AI Transcription"}
+                    </span>
 
-                        <span className="segment-text">
-                          {
-                            segment.text
-                          }
-                        </span>
-                      </button>
-                    ),
-                  )}
+                    {transcript.language && (
+                      <span className="lang-tag">
+                        Language:{" "}
+                        <strong>{transcript.language.toUpperCase()}</strong>
+                      </span>
+                    )}
+
+                    <span className="transcript-count">
+                      {transcript.segments.length} segments
+                    </span>
+                  </div>
+
+                  {transcript.segments.map((segment, index) => (
+                    <button
+                      className="segment"
+                      key={`${segment.start}-${index}`}
+                      onClick={() => seekTo(segment.start)}
+                      title="Click to seek video to this timestamp"
+                    >
+                      <span className="timestamp">
+                        {formatTimestampRange(segment.start, segment.end)}
+                      </span>
+                      <span className="segment-text">{segment.text}</span>
+                    </button>
+                  ))}
                 </div>
               )}
             </section>
