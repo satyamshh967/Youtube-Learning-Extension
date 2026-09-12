@@ -1,16 +1,38 @@
 {
   "manifest_version": 3,
   "name": "YouTube Learning Companion",
-  "version": "0.1.0",
-  "description": "Turn YouTube educational videos into an interactive learning experience.",
+  "version": "0.2.0",
+  "description": "Turn YouTube videos into interactive learning experiences.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage",
+    "scripting",
+    "tabCapture",
+    "offscreen",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "http://127.0.0.1:8000/*"
+  ],
   "action": {
-    "default_popup": "index.html"
+    "default_title": "YouTube Learning Companion"
   },
-  "permissions": [],
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]
