@@ -128,6 +128,63 @@ function extractJsonObject(source: string, marker: string): unknown {
   return null;
 }
 
+function getPlayerResponseFromMainWorld(): Promise<any | null> {
+  return new Promise((resolve) => {
+    const eventName = `__yt_companion_${Math.random().toString(36).slice(2)}__`;
+    let timeoutId: number;
+
+    const onResponse = (event: Event) => {
+      clearTimeout(timeoutId);
+      document.removeEventListener(eventName, onResponse);
+      try {
+        const detail = (event as CustomEvent).detail;
+        if (detail) {
+          const parsed = typeof detail === "string" ? JSON.parse(detail) : detail;
+          resolve(parsed);
+          return;
+        }
+      } catch {}
+      resolve(null);
+    };
+
+    document.addEventListener(eventName, onResponse, { once: true });
+
+    timeoutId = window.setTimeout(() => {
+      document.removeEventListener(eventName, onResponse);
+      resolve(null);
+    }, 500);
+
+    try {
+      const script = document.createElement("script");
+      const nonce = document.querySelector("script[nonce]")?.getAttribute("nonce");
+      if (nonce) {
+        script.setAttribute("nonce", nonce);
+      }
+      script.textContent = `
+        (function() {
+          try {
+            const player = document.getElementById("movie_player");
+            const data = (player && typeof player.getPlayerResponse === "function")
+              ? player.getPlayerResponse()
+              : window.ytInitialPlayerResponse;
+            document.dispatchEvent(new CustomEvent("${eventName}", {
+              detail: JSON.stringify(data)
+            }));
+          } catch(e) {
+            document.dispatchEvent(new CustomEvent("${eventName}", { detail: null }));
+          }
+        })();
+      `;
+      (document.head || document.documentElement).appendChild(script);
+      script.remove();
+    } catch {
+      clearTimeout(timeoutId);
+      document.removeEventListener(eventName, onResponse);
+      resolve(null);
+    }
+  });
+}
+
 async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
   const currentId = targetVideoId || getVideoId();
   if (!currentId) {
@@ -138,7 +195,16 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
     return playerResponseCache.get(currentId);
   }
 
-  // 1. Try extracting from current document scripts
+  // 1. Try accessing player response from main world (most accurate for SPA & live state)
+  try {
+    const mainWorldResponse = await getPlayerResponseFromMainWorld();
+    if (mainWorldResponse?.videoDetails?.videoId === currentId) {
+      playerResponseCache.set(currentId, mainWorldResponse);
+      return mainWorldResponse;
+    }
+  } catch {}
+
+  // 2. Try extracting from current document scripts
   const scripts = Array.from(document.scripts);
   for (const script of scripts) {
     const content = script.textContent ?? "";
@@ -153,7 +219,7 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
     }
   }
 
-  // 2. If single-page navigation occurred or scripts didn't match, fetch the watch page HTML
+  // 3. If single-page navigation occurred or scripts didn't match, fetch the watch page HTML
   try {
     const watchUrl = `https://www.youtube.com/watch?v=${currentId}`;
     const res = await fetch(watchUrl, {
@@ -383,6 +449,17 @@ function formatTimestamp(milliseconds: number): string {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function parseTimestampStringToSeconds(ts: string): number {
+  const parts = ts.trim().split(":").map((p) => parseInt(p, 10));
+  if (parts.length === 3) {
+    return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  }
+  if (parts.length === 2) {
+    return (parts[0] || 0) * 60 + (parts[1] || 0);
+  }
+  return parts[0] || 0;
+}
+
 function parseJson3Transcript(data: any): TranscriptSegment[] {
   if (!Array.isArray(data?.events)) {
     return [];
@@ -410,7 +487,6 @@ function parseJson3Transcript(data: any): TranscriptSegment[] {
       continue;
     }
 
-    // Avoid duplicate lines common in auto-generated captions
     if (text === lastText) {
       continue;
     }
@@ -433,81 +509,464 @@ function parseJson3Transcript(data: any): TranscriptSegment[] {
 }
 
 function parseXmlTranscript(xml: string): TranscriptSegment[] {
-  const parser = new DOMParser();
-  const document = parser.parseFromString(xml, "text/xml");
-  const elements = Array.from(document.querySelectorAll("text"));
   const results: TranscriptSegment[] = [];
   let lastText = "";
 
-  for (const element of elements) {
-    const start = Number(element.getAttribute("start"));
-    const dur = Number(element.getAttribute("dur") ?? 0);
+  // 1. Try regex on legacy <text start="1.23" dur="4.56">text</text>
+  const textMatches = Array.from(
+    xml.matchAll(/<text\s+[^>]*start="([\d.]+)"(?:\s+[^>]*dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/gi),
+  );
 
-    const text = decodeHtmlEntities(element.textContent ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
+  if (textMatches.length > 0) {
+    for (const m of textMatches) {
+      const start = parseFloat(m[1]);
+      const dur = m[2] ? parseFloat(m[2]) : undefined;
+      const raw = m[3].replace(/<[^>]+>/g, "").trim();
+      const text = decodeHtmlEntities(raw).replace(/\s+/g, " ").trim();
 
-    if (!Number.isFinite(start) || !text) {
-      continue;
+      if (!Number.isFinite(start) || !text || text === lastText) {
+        continue;
+      }
+      lastText = text;
+
+      const end = dur !== undefined ? start + dur : undefined;
+      results.push({
+        start,
+        end,
+        timestamp: formatTimestamp(start * 1000),
+        endTimestamp: end !== undefined ? formatTimestamp(end * 1000) : undefined,
+        text,
+      });
     }
 
-    if (text === lastText) {
+    if (results.length > 0) {
+      return results;
+    }
+  }
+
+  // 2. Try regex on SRV3 <p t="1230" d="4560"><s>text</s></p>
+  const pMatches = Array.from(
+    xml.matchAll(/<p\s+[^>]*t="(\d+)"(?:\s+[^>]*d="(\d+)")?[^>]*>([\s\S]*?)<\/p>/gi),
+  );
+
+  if (pMatches.length > 0) {
+    for (const m of pMatches) {
+      const startMs = parseInt(m[1], 10);
+      const durMs = m[2] ? parseInt(m[2], 10) : undefined;
+      const raw = m[3].replace(/<[^>]+>/g, "").trim();
+      const text = decodeHtmlEntities(raw).replace(/\s+/g, " ").trim();
+
+      if (!Number.isFinite(startMs) || !text || text === lastText) {
+        continue;
+      }
+      lastText = text;
+
+      const start = startMs / 1000;
+      const end = durMs !== undefined ? (startMs + durMs) / 1000 : undefined;
+      results.push({
+        start,
+        end,
+        timestamp: formatTimestamp(startMs),
+        endTimestamp: end !== undefined ? formatTimestamp(startMs + (durMs || 0)) : undefined,
+        text,
+      });
+    }
+
+    if (results.length > 0) {
+      return results;
+    }
+  }
+
+  // 3. Fallback: DOMParser
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml, "text/xml");
+    const textEls = Array.from(doc.querySelectorAll("text"));
+
+    if (textEls.length > 0) {
+      for (const el of textEls) {
+        const start = Number(el.getAttribute("start"));
+        const dur = Number(el.getAttribute("dur") ?? 0);
+        const text = decodeHtmlEntities(el.textContent ?? "").replace(/\s+/g, " ").trim();
+
+        if (!Number.isFinite(start) || !text || text === lastText) {
+          continue;
+        }
+        lastText = text;
+
+        const end = dur > 0 ? start + dur : undefined;
+        results.push({
+          start,
+          end,
+          timestamp: formatTimestamp(start * 1000),
+          endTimestamp: end !== undefined ? formatTimestamp(end * 1000) : undefined,
+          text,
+        });
+      }
+    } else {
+      const pEls = Array.from(doc.querySelectorAll("p"));
+      for (const el of pEls) {
+        const startMs = Number(el.getAttribute("t"));
+        const durMs = Number(el.getAttribute("d") ?? 0);
+        const text = decodeHtmlEntities(el.textContent ?? "").replace(/\s+/g, " ").trim();
+
+        if (!Number.isFinite(startMs) || !text || text === lastText) {
+          continue;
+        }
+        lastText = text;
+
+        const start = startMs / 1000;
+        const end = durMs > 0 ? (startMs + durMs) / 1000 : undefined;
+        results.push({
+          start,
+          end,
+          timestamp: formatTimestamp(startMs),
+          endTimestamp: end !== undefined ? formatTimestamp(startMs + durMs) : undefined,
+          text,
+        });
+      }
+    }
+  } catch {}
+
+  return results;
+}
+
+function parseVttTranscript(vtt: string): TranscriptSegment[] {
+  const lines = vtt.split(/\r?\n/);
+  const segments: TranscriptSegment[] = [];
+  let currentStart: number | null = null;
+  let currentEnd: number | undefined = undefined;
+  let currentText = "";
+  let lastText = "";
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const timeMatch = line.match(
+      /(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})/,
+    );
+
+    if (timeMatch) {
+      if (currentStart !== null && currentText.trim()) {
+        const text = decodeHtmlEntities(currentText.trim()).replace(/\s+/g, " ");
+        if (text && text !== lastText) {
+          segments.push({
+            start: currentStart,
+            end: currentEnd,
+            timestamp: formatTimestamp(currentStart * 1000),
+            endTimestamp: currentEnd !== undefined ? formatTimestamp(currentEnd * 1000) : undefined,
+            text,
+          });
+          lastText = text;
+        }
+      }
+
+      const sHrs = timeMatch[1] ? parseInt(timeMatch[1], 10) : 0;
+      const sMin = parseInt(timeMatch[2], 10);
+      const sSec = parseInt(timeMatch[3], 10);
+      const sMs = parseInt(timeMatch[4], 10);
+      currentStart = sHrs * 3600 + sMin * 60 + sSec + sMs / 1000;
+
+      const eHrs = timeMatch[5] ? parseInt(timeMatch[5], 10) : 0;
+      const eMin = parseInt(timeMatch[6], 10);
+      const eSec = parseInt(timeMatch[7], 10);
+      const eMs = parseInt(timeMatch[8], 10);
+      currentEnd = eHrs * 3600 + eMin * 60 + eSec + eMs / 1000;
+      currentText = "";
+    } else if (
+      currentStart !== null &&
+      line &&
+      !line.startsWith("WEBVTT") &&
+      !line.startsWith("NOTE") &&
+      !/^\d+$/.test(line)
+    ) {
+      const clean = line.replace(/<[^>]+>/g, "").trim();
+      if (clean) {
+        currentText = currentText ? `${currentText} ${clean}` : clean;
+      }
+    }
+  }
+
+  if (currentStart !== null && currentText.trim()) {
+    const text = decodeHtmlEntities(currentText.trim()).replace(/\s+/g, " ");
+    if (text && text !== lastText) {
+      segments.push({
+        start: currentStart,
+        end: currentEnd,
+        timestamp: formatTimestamp(currentStart * 1000),
+        endTimestamp: currentEnd !== undefined ? formatTimestamp(currentEnd * 1000) : undefined,
+        text,
+      });
+    }
+  }
+
+  return segments;
+}
+
+function parseTranscriptBody(body: string): TranscriptSegment[] {
+  if (!body || !body.trim()) {
+    return [];
+  }
+
+  const trimmed = body.trim();
+
+  // 1. JSON3 format
+  if (trimmed.startsWith("{")) {
+    try {
+      const data = JSON.parse(trimmed);
+      const segs = parseJson3Transcript(data);
+      if (segs.length > 0) {
+        return segs;
+      }
+    } catch {}
+  }
+
+  // 2. WebVTT format
+  if (trimmed.startsWith("WEBVTT") || trimmed.includes("-->")) {
+    const segs = parseVttTranscript(trimmed);
+    if (segs.length > 0) {
+      return segs;
+    }
+  }
+
+  // 3. XML format (Legacy or SRV3)
+  if (
+    trimmed.startsWith("<") ||
+    trimmed.includes("<transcript") ||
+    trimmed.includes("<timedtext") ||
+    trimmed.includes("<p ") ||
+    trimmed.includes("<text ")
+  ) {
+    const segs = parseXmlTranscript(trimmed);
+    if (segs.length > 0) {
+      return segs;
+    }
+  }
+
+  return [];
+}
+
+function extractSegmentsFromDom(): TranscriptSegment[] {
+  const segmentElements = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      "ytd-transcript-segment-renderer, ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer",
+    ),
+  );
+
+  if (segmentElements.length === 0) {
+    return [];
+  }
+
+  const results: TranscriptSegment[] = [];
+  let lastText = "";
+
+  for (const el of segmentElements) {
+    const tsEl = el.querySelector<HTMLElement>(
+      ".segment-timestamp, [class*='segment-timestamp'], .yt-core-attributed-string",
+    );
+    const textEl = el.querySelector<HTMLElement>(
+      ".segment-text, [class*='segment-text']",
+    );
+
+    let tsText = (tsEl?.textContent || "").trim();
+    const match = tsText.match(/(\d{1,2}:)?\d{2}:\d{2}/);
+    if (match) {
+      tsText = match[0];
+    }
+
+    let text = (textEl?.textContent || "").trim();
+    if (!text && tsText) {
+      text = (el.textContent || "").replace(tsText, "").trim();
+    }
+
+    text = decodeHtmlEntities(text).replace(/\s+/g, " ").trim();
+    if (!text || text === lastText) {
       continue;
     }
     lastText = text;
 
-    const end = dur > 0 ? start + dur : undefined;
-
+    const start = parseTimestampStringToSeconds(tsText);
     results.push({
       start,
-      end,
-      timestamp: formatTimestamp(start * 1000),
-      endTimestamp:
-        end !== undefined ? formatTimestamp(end * 1000) : undefined,
+      timestamp: tsText || formatTimestamp(start * 1000),
       text,
     });
+  }
+
+  for (let i = 0; i < results.length; i++) {
+    if (i < results.length - 1) {
+      results[i].end = results[i + 1].start;
+      results[i].endTimestamp = results[i + 1].timestamp;
+    }
   }
 
   return results;
 }
 
+function findAndClickShowTranscriptButton(): boolean {
+  if (document.querySelector("ytd-transcript-segment-renderer")) {
+    return true;
+  }
+
+  // 1. Direct transcript button in description
+  const directBtn = document.querySelector<HTMLElement>(
+    "ytd-video-description-transcript-section-renderer button, " +
+    "ytd-video-description-transcript-section-renderer ytd-button-renderer, " +
+    "button[aria-label*='transcript' i], " +
+    "button[aria-label*='Transcript' i]",
+  );
+  if (directBtn) {
+    directBtn.click();
+    return true;
+  }
+
+  // 2. If description is collapsed, click "more" / expand
+  const expandBtn = document.querySelector<HTMLElement>(
+    "#expand, #description-inline-expander #expand, tp-yt-paper-button#expand",
+  );
+  if (expandBtn && expandBtn.offsetParent !== null) {
+    try {
+      expandBtn.click();
+    } catch {}
+  }
+
+  // 3. Search buttons in description
+  const description = document.querySelector("#description, #description-inline-expander, ytd-watch-metadata");
+  if (description) {
+    const buttons = Array.from(
+      description.querySelectorAll<HTMLElement>("button, ytd-button-renderer, tp-yt-paper-button"),
+    );
+    for (const btn of buttons) {
+      const text = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
+      if (text.includes("transcript")) {
+        btn.click();
+        return true;
+      }
+    }
+  }
+
+  // 4. Try the "More actions" menu under the video
+  const moreActionsBtn = document.querySelector<HTMLElement>(
+    "#actions button[aria-label*='More' i], #actions-inner button[aria-label*='More' i]",
+  );
+  if (moreActionsBtn) {
+    try {
+      moreActionsBtn.click();
+      window.setTimeout(() => {
+        const items = Array.from(
+          document.querySelectorAll<HTMLElement>("ytd-menu-service-item-renderer, tp-yt-paper-item"),
+        );
+        for (const item of items) {
+          if ((item.textContent || "").toLowerCase().includes("transcript")) {
+            item.click();
+            break;
+          }
+        }
+      }, 100);
+    } catch {}
+  }
+
+  return false;
+}
+
+async function extractTranscriptFromDom(timeoutMs = 2500): Promise<TranscriptSegment[]> {
+  let segments = extractSegmentsFromDom();
+  if (segments.length > 0) {
+    return segments;
+  }
+
+  findAndClickShowTranscriptButton();
+
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    segments = extractSegmentsFromDom();
+    if (segments.length > 0) {
+      return segments;
+    }
+  }
+
+  return [];
+}
+
 async function fetchCaptionTrack(
   track: CaptionTrack,
 ): Promise<TranscriptSegment[]> {
-  const url = new URL(track.baseUrl, window.location.origin);
-  url.searchParams.set("fmt", "json3");
+  const rawBase = track.baseUrl.replace(/&amp;/g, "&");
 
-  const response = await fetch(url.toString(), {
-    credentials: "include",
-    signal: AbortSignal.timeout(7000),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `YouTube caption request failed with HTTP ${response.status}.`,
-    );
-  }
-
-  const body = await response.text();
-
-  if (!body.trim()) {
-    throw new Error("YouTube returned an empty caption track.");
-  }
+  // Create list of URLs to try:
+  // 1. Raw unmodified baseUrl (signature is valid for this exact URL)
+  // 2. fmt=srv3 (XML v3 format)
+  // 3. fmt=vtt (WebVTT format)
+  // 4. fmt=json3 (JSON3 format)
+  const variants: string[] = [rawBase];
 
   try {
-    const data = JSON.parse(body);
-    const segments = parseJson3Transcript(data);
-    if (segments.length > 0) {
-      return segments;
+    const uSrv = new URL(rawBase, window.location.origin);
+    if (!uSrv.searchParams.has("fmt")) {
+      uSrv.searchParams.set("fmt", "srv3");
+      variants.push(uSrv.toString());
     }
-  } catch {
-    const segments = parseXmlTranscript(body);
-    if (segments.length > 0) {
-      return segments;
+  } catch {}
+
+  try {
+    const uVtt = new URL(rawBase, window.location.origin);
+    if (!uVtt.searchParams.has("fmt")) {
+      uVtt.searchParams.set("fmt", "vtt");
+      variants.push(uVtt.toString());
+    }
+  } catch {}
+
+  try {
+    const uJson = new URL(rawBase, window.location.origin);
+    if (!uJson.searchParams.has("fmt")) {
+      uJson.searchParams.set("fmt", "json3");
+      variants.push(uJson.toString());
+    }
+  } catch {}
+
+  for (const url of variants) {
+    try {
+      const response = await fetch(url, {
+        credentials: "include",
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const body = await response.text();
+      if (!body || !body.trim()) {
+        continue;
+      }
+
+      const segments = parseTranscriptBody(body);
+      if (segments.length > 0) {
+        return segments;
+      }
+    } catch {
+      // Try next variant
     }
   }
 
-  throw new Error("YouTube returned no transcript segments.");
+  // Fallback: try rawBase with credentials: "omit" in case cookies interfered
+  try {
+    const response = await fetch(rawBase, {
+      credentials: "omit",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (response.ok) {
+      const body = await response.text();
+      if (body && body.trim()) {
+        const segments = parseTranscriptBody(body);
+        if (segments.length > 0) {
+          return segments;
+        }
+      }
+    }
+  } catch {}
+
+  throw new Error("YouTube returned an empty caption track.");
 }
 
 async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; language?: string }> {
@@ -517,43 +976,65 @@ async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; langu
     throw new Error("No YouTube video detected.");
   }
 
+  // Tier 1: Try YouTube native DOM transcript (fast, already authenticated, 100% formatted)
+  try {
+    const domSegments = await extractTranscriptFromDom(1000);
+    if (domSegments.length > 0) {
+      return {
+        segments: domSegments,
+        language: "en",
+      };
+    }
+  } catch {
+    // Continue to network fetching
+  }
+
+  // Tier 2: Caption tracks from player response
   const tracks = await getCaptionTracks(videoId);
 
-  if (tracks.length === 0) {
-    throw new Error(
-      "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
-    );
-  }
+  if (tracks.length > 0) {
+    const preferredTrack = selectCaptionTrack(tracks);
+    const orderedTracks = preferredTrack
+      ? [preferredTrack, ...tracks.filter((track) => track !== preferredTrack)]
+      : tracks;
 
-  const preferredTrack = selectCaptionTrack(tracks);
-
-  if (!preferredTrack) {
-    throw new Error("No usable YouTube caption track was found.");
-  }
-
-  try {
-    const segments = await fetchCaptionTrack(preferredTrack);
-    return {
-      segments,
-      language: preferredTrack.languageCode || preferredTrack.name?.simpleText,
-    };
-  } catch (error) {
-    const alternatives = tracks.filter((track) => track !== preferredTrack);
-
-    for (const track of alternatives) {
+    for (const track of orderedTracks) {
       try {
         const segments = await fetchCaptionTrack(track);
-        return {
-          segments,
-          language: track.languageCode || track.name?.simpleText,
-        };
+        if (segments.length > 0) {
+          return {
+            segments,
+            language: track.languageCode || track.name?.simpleText || "en",
+          };
+        }
       } catch {
         continue;
       }
     }
-
-    throw error;
   }
+
+  // Tier 3: DOM transcript retry with longer timeout (in case the panel took time to load from YouTube's server)
+  try {
+    const domSegments = await extractTranscriptFromDom(2500);
+    if (domSegments.length > 0) {
+      return {
+        segments: domSegments,
+        language: "en",
+      };
+    }
+  } catch {
+    // Continue to error
+  }
+
+  if (tracks.length === 0) {
+    throw new Error(
+      "YouTube captions are unavailable for this video. Captions or transcripts have not been provided by the creator or YouTube for this video.",
+    );
+  }
+
+  throw new Error(
+    "Could not retrieve transcript from YouTube captions or page transcript. Please make sure transcripts/captions are enabled for this video.",
+  );
 }
 
 function seekVideo(time: number): boolean {
