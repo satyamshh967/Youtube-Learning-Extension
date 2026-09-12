@@ -15,126 +15,8 @@ interface CaptionTrack {
   };
 }
 
-let contentRecorder: MediaRecorder | null = null;
-let contentChunks: Blob[] = [];
-let contentStream: MediaStream | null = null;
 let attachedVideo: HTMLVideoElement | null = null;
-
-function cleanupContentAudio(): void {
-  if (contentStream) {
-    contentStream.getTracks().forEach((track) => track.stop());
-    contentStream = null;
-  }
-  contentRecorder = null;
-  contentChunks = [];
-}
-
-function startContentAudioRecording(): { success: boolean; isPaused: boolean } {
-  cleanupContentAudio();
-
-  const video = document.querySelector<HTMLVideoElement>("video");
-  if (!video) {
-    throw new Error("No YouTube video player element was found on this page.");
-  }
-
-  const stream = (video as any).captureStream
-    ? (video as any).captureStream()
-    : (video as any).mozCaptureStream
-      ? (video as any).mozCaptureStream()
-      : null;
-
-  if (!stream) {
-    throw new Error("The browser could not capture the stream from the video element.");
-  }
-
-  const audioTracks = stream.getAudioTracks();
-  if (!audioTracks || audioTracks.length === 0) {
-    throw new Error("No audio track found in the video stream. Please ensure the video is loaded.");
-  }
-
-  contentStream = new MediaStream(audioTracks);
-
-  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : "audio/webm";
-
-  contentRecorder = new MediaRecorder(contentStream, { mimeType });
-  contentChunks = [];
-
-  contentRecorder.ondataavailable = (event) => {
-    if (event.data.size > 0) {
-      contentChunks.push(event.data);
-      const totalBytes = contentChunks.reduce((acc, c) => acc + c.size, 0);
-
-      chrome.runtime
-        .sendMessage({
-          type: "AUDIO_CAPTURE_PROGRESS",
-          chunks: contentChunks.length,
-          bytes: totalBytes,
-          durationMs: contentChunks.length * 1000,
-          timestamp: Date.now(),
-        })
-        .catch(() => { });
-    }
-  };
-
-  contentRecorder.onerror = () => {
-    chrome.runtime
-      .sendMessage({
-        type: "TRANSCRIPTION_FAILED",
-        error: "Audio recording failed in YouTube tab.",
-        timestamp: Date.now(),
-      })
-      .catch(() => { });
-  };
-
-  contentRecorder.start(1000);
-
-  chrome.runtime
-    .sendMessage({
-      type: "AUDIO_CAPTURE_STARTED",
-      timestamp: Date.now(),
-    })
-    .catch(() => { });
-
-  return { success: true, isPaused: video.paused };
-}
-
-function stopContentAudioRecording(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    if (!contentRecorder || contentRecorder.state === "inactive") {
-      cleanupContentAudio();
-      reject(new Error("No active audio recorder found."));
-      return;
-    }
-
-    contentRecorder.onstop = () => {
-      try {
-        const blob = new Blob(contentChunks, { type: "audio/webm" });
-        cleanupContentAudio();
-
-        if (blob.size === 0) {
-          reject(new Error("Captured audio was empty."));
-          return;
-        }
-
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          resolve(reader.result as string);
-        };
-        reader.onerror = () => {
-          reject(new Error("Failed to read audio blob."));
-        };
-        reader.readAsDataURL(blob);
-      } catch (err) {
-        cleanupContentAudio();
-        reject(err);
-      }
-    };
-
-    contentRecorder.stop();
-  });
-}
+const playerResponseCache = new Map<string, any>();
 
 function getVideoId(): string | null {
   const url = new URL(window.location.href);
@@ -156,7 +38,6 @@ function getVideoTitle(): string {
 
   for (const selector of selectors) {
     const element = document.querySelector<HTMLElement>(selector);
-
     const title = element?.textContent?.trim();
 
     if (title) {
@@ -247,21 +128,48 @@ function extractJsonObject(source: string, marker: string): unknown {
   return null;
 }
 
-function getPlayerResponse(): any | null {
-  const scripts = Array.from(document.scripts);
+async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
+  const currentId = targetVideoId || getVideoId();
+  if (!currentId) {
+    return null;
+  }
 
+  if (playerResponseCache.has(currentId)) {
+    return playerResponseCache.get(currentId);
+  }
+
+  // 1. Try extracting from current document scripts
+  const scripts = Array.from(document.scripts);
   for (const script of scripts) {
     const content = script.textContent ?? "";
-
     if (!content.includes("ytInitialPlayerResponse")) {
       continue;
     }
 
-    const response = extractJsonObject(content, "ytInitialPlayerResponse");
-
-    if (response) {
+    const response = extractJsonObject(content, "ytInitialPlayerResponse") as any;
+    if (response?.videoDetails?.videoId === currentId) {
+      playerResponseCache.set(currentId, response);
       return response;
     }
+  }
+
+  // 2. If single-page navigation occurred or scripts didn't match, fetch the watch page HTML
+  try {
+    const watchUrl = `https://www.youtube.com/watch?v=${currentId}`;
+    const res = await fetch(watchUrl, {
+      credentials: "include",
+      signal: AbortSignal.timeout(7000),
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const response = extractJsonObject(html, "ytInitialPlayerResponse") as any;
+      if (response) {
+        playerResponseCache.set(currentId, response);
+        return response;
+      }
+    }
+  } catch {
+    // Network failure or timeout
   }
 
   return null;
@@ -273,10 +181,13 @@ function getVideoDuration(): number | null {
     return video.duration;
   }
 
-  const playerResponse = getPlayerResponse();
-  const lengthSeconds = Number(playerResponse?.videoDetails?.lengthSeconds);
-  if (Number.isFinite(lengthSeconds) && lengthSeconds > 0) {
-    return lengthSeconds;
+  const currentId = getVideoId();
+  if (currentId && playerResponseCache.has(currentId)) {
+    const cached = playerResponseCache.get(currentId);
+    const lengthSeconds = Number(cached?.videoDetails?.lengthSeconds);
+    if (Number.isFinite(lengthSeconds) && lengthSeconds > 0) {
+      return lengthSeconds;
+    }
   }
 
   return null;
@@ -290,21 +201,20 @@ function getVideoPlaybackState(): { currentTime: number; isPaused: boolean } {
   };
 }
 
-function hasAvailableCaptions(): boolean {
-  const tracks = getCaptionTracks();
-  return tracks.length > 0;
-}
-
 function getVideoInfo(): VideoInfo {
   const { currentTime, isPaused } = getVideoPlaybackState();
+  const currentId = getVideoId();
+  const cached = currentId ? playerResponseCache.get(currentId) : null;
+  const tracks = cached?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
   return {
-    id: getVideoId(),
+    id: currentId,
     title: getVideoTitle(),
     url: window.location.href,
     duration: getVideoDuration(),
     currentTime,
     isPaused,
-    hasCaptions: hasAvailableCaptions(),
+    hasCaptions: Array.isArray(tracks) ? tracks.length > 0 : undefined,
   };
 }
 
@@ -385,20 +295,23 @@ function notifyVideoChange(): void {
 
   attachVideoListeners();
 
-  waitForRealMetadata()
-    .then((video) => {
-      chrome.runtime
-        .sendMessage({
-          type: "VIDEO_INFO_UPDATED",
-          video,
-        })
-        .catch(() => { });
-    })
-    .catch(() => { });
+  // Pre-load player response for fast caption access
+  getPlayerResponse(videoId).then(() => {
+    waitForRealMetadata()
+      .then((video) => {
+        chrome.runtime
+          .sendMessage({
+            type: "VIDEO_INFO_UPDATED",
+            video,
+          })
+          .catch(() => { });
+      })
+      .catch(() => { });
+  }).catch(() => {});
 }
 
-function getCaptionTracks(): CaptionTrack[] {
-  const playerResponse = getPlayerResponse();
+async function getCaptionTracks(videoId?: string): Promise<CaptionTrack[]> {
+  const playerResponse = await getPlayerResponse(videoId);
 
   const tracks =
     playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
@@ -420,44 +333,45 @@ function selectCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
     return null;
   }
 
+  // 1. English manual captions
   const englishManual = tracks.find(
-    (track) => track.languageCode === "en" && track.kind !== "asr",
+    (track) =>
+      (track.languageCode === "en" || track.languageCode?.startsWith("en-")) &&
+      track.kind !== "asr",
   );
-
   if (englishManual) {
     return englishManual;
   }
 
-  const english = tracks.find((track) => track.languageCode === "en");
-
-  if (english) {
-    return english;
+  // 2. English auto-generated captions (ASR)
+  const englishAsr = tracks.find(
+    (track) =>
+      track.languageCode === "en" || track.languageCode?.startsWith("en-"),
+  );
+  if (englishAsr) {
+    return englishAsr;
   }
 
+  // 3. Any manual captions in other languages
   const manual = tracks.find((track) => track.kind !== "asr");
-
   if (manual) {
     return manual;
   }
 
+  // 4. Default fallback track
   return tracks[0];
 }
 
 function decodeHtmlEntities(value: string): string {
   const textarea = document.createElement("textarea");
-
   textarea.innerHTML = value;
-
   return textarea.value;
 }
 
 function formatTimestamp(milliseconds: number): string {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
-
   const hours = Math.floor(totalSeconds / 3600);
-
   const minutes = Math.floor((totalSeconds % 3600) / 60);
-
   const seconds = totalSeconds % 60;
 
   if (hours > 0) {
@@ -475,24 +389,32 @@ function parseJson3Transcript(data: any): TranscriptSegment[] {
   }
 
   const segments: TranscriptSegment[] = [];
+  let lastText = "";
 
   for (const event of data.events) {
     if (!Array.isArray(event?.segs)) {
       continue;
     }
 
-    const text = event.segs
+    const rawText = event.segs
       .map((segment: any) => segment?.utf8 ?? "")
       .join("")
       .replace(/\s+/g, " ")
       .trim();
 
+    const text = decodeHtmlEntities(rawText);
     const startMs = Number(event.tStartMs ?? 0);
     const durationMs = Number(event.dDurationMs ?? 0);
 
-    if (!text || !Number.isFinite(startMs)) {
+    if (!text || !Number.isFinite(startMs) || text === "\n") {
       continue;
     }
+
+    // Avoid duplicate lines common in auto-generated captions
+    if (text === lastText) {
+      continue;
+    }
+    lastText = text;
 
     const start = startMs / 1000;
     const end = durationMs > 0 ? (startMs + durationMs) / 1000 : undefined;
@@ -515,6 +437,7 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
   const document = parser.parseFromString(xml, "text/xml");
   const elements = Array.from(document.querySelectorAll("text"));
   const results: TranscriptSegment[] = [];
+  let lastText = "";
 
   for (const element of elements) {
     const start = Number(element.getAttribute("start"));
@@ -527,6 +450,11 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
     if (!Number.isFinite(start) || !text) {
       continue;
     }
+
+    if (text === lastText) {
+      continue;
+    }
+    lastText = text;
 
     const end = dur > 0 ? start + dur : undefined;
 
@@ -547,11 +475,11 @@ async function fetchCaptionTrack(
   track: CaptionTrack,
 ): Promise<TranscriptSegment[]> {
   const url = new URL(track.baseUrl, window.location.origin);
-
   url.searchParams.set("fmt", "json3");
 
   const response = await fetch(url.toString(), {
     credentials: "include",
+    signal: AbortSignal.timeout(7000),
   });
 
   if (!response.ok) {
@@ -568,15 +496,12 @@ async function fetchCaptionTrack(
 
   try {
     const data = JSON.parse(body);
-
     const segments = parseJson3Transcript(data);
-
     if (segments.length > 0) {
       return segments;
     }
   } catch {
     const segments = parseXmlTranscript(body);
-
     if (segments.length > 0) {
       return segments;
     }
@@ -585,17 +510,19 @@ async function fetchCaptionTrack(
   throw new Error("YouTube returned no transcript segments.");
 }
 
-async function fetchTranscript(): Promise<TranscriptSegment[]> {
+async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; language?: string }> {
   const videoId = getVideoId();
 
   if (!videoId) {
     throw new Error("No YouTube video detected.");
   }
 
-  const tracks = getCaptionTracks();
+  const tracks = await getCaptionTracks(videoId);
 
   if (tracks.length === 0) {
-    throw new Error("YouTube does not expose captions for this video.");
+    throw new Error(
+      "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
+    );
   }
 
   const preferredTrack = selectCaptionTrack(tracks);
@@ -605,13 +532,21 @@ async function fetchTranscript(): Promise<TranscriptSegment[]> {
   }
 
   try {
-    return await fetchCaptionTrack(preferredTrack);
+    const segments = await fetchCaptionTrack(preferredTrack);
+    return {
+      segments,
+      language: preferredTrack.languageCode || preferredTrack.name?.simpleText,
+    };
   } catch (error) {
     const alternatives = tracks.filter((track) => track !== preferredTrack);
 
     for (const track of alternatives) {
       try {
-        return await fetchCaptionTrack(track);
+        const segments = await fetchCaptionTrack(track);
+        return {
+          segments,
+          language: track.languageCode || track.name?.simpleText,
+        };
       } catch {
         continue;
       }
@@ -630,6 +565,16 @@ function seekVideo(time: number): boolean {
 
   video.currentTime = time;
 
+  // Also seek YouTube custom player if exposed
+  try {
+    const moviePlayer = document.getElementById("movie_player") as any;
+    if (typeof moviePlayer?.seekTo === "function") {
+      moviePlayer.seekTo(time, true);
+    }
+  } catch {
+    // Ignore
+  }
+
   return true;
 }
 
@@ -641,35 +586,6 @@ chrome.runtime.onMessage.addListener(
         video: getVideoInfo(),
       });
 
-      return false;
-    }
-
-    if (message.type === "PLAY_VIDEO") {
-      const video = document.querySelector<HTMLVideoElement>("video");
-      if (video) {
-        video
-          .play()
-          .then(() => sendResponse({ success: true }))
-          .catch((err) =>
-            sendResponse({
-              success: false,
-              error: err instanceof Error ? err.message : "Could not play video.",
-            }),
-          );
-        return true;
-      }
-      sendResponse({ success: false, error: "No video element found." });
-      return false;
-    }
-
-    if (message.type === "PAUSE_VIDEO") {
-      const video = document.querySelector<HTMLVideoElement>("video");
-      if (video) {
-        video.pause();
-        sendResponse({ success: true });
-        return false;
-      }
-      sendResponse({ success: false, error: "No video element found." });
       return false;
     }
 
@@ -695,13 +611,14 @@ chrome.runtime.onMessage.addListener(
 
     if (message.type === "GET_TRANSCRIPT") {
       fetchTranscript()
-        .then((segments) => {
+        .then(({ segments, language }) => {
           const video = getVideoInfo();
 
           sendResponse({
             success: true,
             transcript: {
               videoId: video.id,
+              language,
               duration: video.duration,
               source: "youtube_captions",
               segments,
@@ -714,74 +631,11 @@ chrome.runtime.onMessage.addListener(
             error:
               error instanceof Error
                 ? error.message
-                : "Failed to fetch transcript.",
+                : "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
           });
         });
 
       return true;
-    }
-
-    if (message.type === "START_CONTENT_AUDIO_CAPTURE") {
-      try {
-        const result = startContentAudioRecording();
-        sendResponse(result);
-      } catch (err) {
-        sendResponse({
-          success: false,
-          error:
-            err instanceof Error ? err.message : "Could not start audio capture.",
-        });
-      }
-      return false;
-    }
-
-    if (message.type === "STOP_CONTENT_AUDIO_CAPTURE") {
-      stopContentAudioRecording()
-        .then((audioDataUrl) => {
-          sendResponse({ success: true, audioDataUrl });
-        })
-        .catch((err) => {
-          sendResponse({
-            success: false,
-            error:
-              err instanceof Error ? err.message : "Could not stop audio capture.",
-          });
-        });
-      return true;
-    }
-
-    if (message.type === "PAUSE_CONTENT_AUDIO_CAPTURE") {
-      if (contentRecorder && contentRecorder.state === "recording") {
-        contentRecorder.pause();
-        chrome.runtime
-          .sendMessage({
-            type: "TRANSCRIPTION_PAUSED",
-            timestamp: Date.now(),
-          })
-          .catch(() => { });
-      }
-      sendResponse({ success: true });
-      return false;
-    }
-
-    if (message.type === "RESUME_CONTENT_AUDIO_CAPTURE") {
-      if (contentRecorder && contentRecorder.state === "paused") {
-        contentRecorder.resume();
-        chrome.runtime
-          .sendMessage({
-            type: "TRANSCRIPTION_RESUMED",
-            timestamp: Date.now(),
-          })
-          .catch(() => { });
-      }
-      sendResponse({ success: true });
-      return false;
-    }
-
-    if (message.type === "CANCEL_CONTENT_AUDIO_CAPTURE") {
-      cleanupContentAudio();
-      sendResponse({ success: true });
-      return false;
     }
 
     return false;
@@ -789,12 +643,10 @@ chrome.runtime.onMessage.addListener(
 );
 
 let lastVideoId = getVideoId();
-
 let lastUrl = window.location.href;
 
 function detectNavigation(): void {
   const currentUrl = window.location.href;
-
   const currentVideoId = getVideoId();
 
   if (currentUrl === lastUrl && currentVideoId === lastVideoId) {
@@ -802,16 +654,13 @@ function detectNavigation(): void {
   }
 
   lastUrl = currentUrl;
-
   lastVideoId = currentVideoId;
 
   window.setTimeout(() => {
     notifyVideoChange();
-  }, 500);
+  }, 400);
 }
 
 document.addEventListener("yt-navigate-finish", detectNavigation);
-
 window.addEventListener("popstate", detectNavigation);
-
-window.setTimeout(notifyVideoChange, 1500);
+window.setTimeout(notifyVideoChange, 1000);

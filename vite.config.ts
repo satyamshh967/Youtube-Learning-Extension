@@ -24,10 +24,6 @@ export default defineConfig({
           __dirname,
           "src/background.ts",
         ),
-        offscreen: resolve(
-          __dirname,
-          "offscreen.html",
-        ),
       },
 
       output: {
@@ -36,9 +32,7 @@ export default defineConfig({
             chunk.name ===
               "content" ||
             chunk.name ===
-              "background" ||
-            chunk.name ===
-              "offscreen"
+              "background"
           ) {
             return "[name].js";
           }

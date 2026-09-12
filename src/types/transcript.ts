@@ -21,25 +21,19 @@ export interface Transcript {
   title?: string;
   language?: string;
   languageProbability?: number;
-  source?: "youtube_captions" | "whisper_audio";
+  source?: "youtube_captions" | "fallback";
   duration?: number | null;
   segments: TranscriptSegment[];
 }
 
 export type TranscriptionStatus =
   | "idle"
-  | "detecting_video"
-  | "preparing"
-  | "capturing"
-  | "transcribing"
-  | "finalizing"
-  | "paused"
+  | "loading"
   | "completed"
-  | "failed"
-  | "cancelled";
+  | "failed";
 
 // ---------------------------------------------------------------------------
-// Typed events for the transcription hook system
+// Typed events for extension message passing
 // ---------------------------------------------------------------------------
 
 interface EventBase {
@@ -49,37 +43,6 @@ interface EventBase {
 
 export interface TranscriptionStartedEvent extends EventBase {
   type: "TRANSCRIPTION_STARTED";
-}
-
-export interface AudioCaptureStartedEvent extends EventBase {
-  type: "AUDIO_CAPTURE_STARTED";
-}
-
-export interface AudioCaptureProgressEvent extends EventBase {
-  type: "AUDIO_CAPTURE_PROGRESS";
-  chunks: number;
-  bytes: number;
-  durationMs: number;
-}
-
-export interface TranscriptionProgressEvent extends EventBase {
-  type: "TRANSCRIPTION_PROGRESS";
-  stage: "recording" | "sending" | "parsing";
-}
-
-export interface TranscriptSegmentReceivedEvent extends EventBase {
-  type: "TRANSCRIPT_SEGMENT_RECEIVED";
-  segment: TranscriptSegment;
-  index: number;
-  total: number;
-}
-
-export interface TranscriptionPausedEvent extends EventBase {
-  type: "TRANSCRIPTION_PAUSED";
-}
-
-export interface TranscriptionResumedEvent extends EventBase {
-  type: "TRANSCRIPTION_RESUMED";
 }
 
 export interface TranscriptionCompletedEvent extends EventBase {
@@ -92,18 +55,7 @@ export interface TranscriptionFailedEvent extends EventBase {
   error: string;
 }
 
-export interface TranscriptionCancelledEvent extends EventBase {
-  type: "TRANSCRIPTION_CANCELLED";
-}
-
 export type TranscriptionEvent =
   | TranscriptionStartedEvent
-  | AudioCaptureStartedEvent
-  | AudioCaptureProgressEvent
-  | TranscriptionProgressEvent
-  | TranscriptSegmentReceivedEvent
-  | TranscriptionPausedEvent
-  | TranscriptionResumedEvent
   | TranscriptionCompletedEvent
-  | TranscriptionFailedEvent
-  | TranscriptionCancelledEvent;
+  | TranscriptionFailedEvent;

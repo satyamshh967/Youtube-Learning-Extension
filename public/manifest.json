@@ -8,13 +8,10 @@
     "tabs",
     "storage",
     "scripting",
-    "tabCapture",
-    "offscreen",
     "sidePanel"
   ],
   "host_permissions": [
-    "https://www.youtube.com/*",
-    "http://127.0.0.1:8000/*"
+    "https://www.youtube.com/*"
   ],
   "action": {
     "default_title": "YouTube Learning Companion"
