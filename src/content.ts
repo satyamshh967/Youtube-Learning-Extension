@@ -512,16 +512,21 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
   const results: TranscriptSegment[] = [];
   let lastText = "";
 
-  // 1. Try regex on legacy <text start="1.23" dur="4.56">text</text>
+  // 1. Regex on <text ...>...</text> (handles attributes in any order)
   const textMatches = Array.from(
-    xml.matchAll(/<text\s+[^>]*start="([\d.]+)"(?:\s+[^>]*dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/gi),
+    xml.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi),
   );
 
   if (textMatches.length > 0) {
     for (const m of textMatches) {
-      const start = parseFloat(m[1]);
-      const dur = m[2] ? parseFloat(m[2]) : undefined;
-      const raw = m[3].replace(/<[^>]+>/g, "").trim();
+      const attrs = m[1];
+      const startMatch = attrs.match(/\bstart="([\d.]+)"/i);
+      const durMatch = attrs.match(/\bdur="([\d.]+)"/i);
+      if (!startMatch) continue;
+
+      const start = parseFloat(startMatch[1]);
+      const dur = durMatch ? parseFloat(durMatch[1]) : undefined;
+      const raw = m[2].replace(/<[^>]+>/g, "").trim();
       const text = decodeHtmlEntities(raw).replace(/\s+/g, " ").trim();
 
       if (!Number.isFinite(start) || !text || text === lastText) {
@@ -544,16 +549,21 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
     }
   }
 
-  // 2. Try regex on SRV3 <p t="1230" d="4560"><s>text</s></p>
+  // 2. Regex on <p ...>...</p> (SRV3 format, handles attributes in any order)
   const pMatches = Array.from(
-    xml.matchAll(/<p\s+[^>]*t="(\d+)"(?:\s+[^>]*d="(\d+)")?[^>]*>([\s\S]*?)<\/p>/gi),
+    xml.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi),
   );
 
   if (pMatches.length > 0) {
     for (const m of pMatches) {
-      const startMs = parseInt(m[1], 10);
-      const durMs = m[2] ? parseInt(m[2], 10) : undefined;
-      const raw = m[3].replace(/<[^>]+>/g, "").trim();
+      const attrs = m[1];
+      const tMatch = attrs.match(/\bt="(\d+)"/i);
+      const dMatch = attrs.match(/\bd="(\d+)"/i);
+      if (!tMatch) continue;
+
+      const startMs = parseInt(tMatch[1], 10);
+      const durMs = dMatch ? parseInt(dMatch[1], 10) : undefined;
+      const raw = m[2].replace(/<[^>]+>/g, "").trim();
       const text = decodeHtmlEntities(raw).replace(/\s+/g, " ").trim();
 
       if (!Number.isFinite(startMs) || !text || text === lastText) {
@@ -577,11 +587,11 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
     }
   }
 
-  // 3. Fallback: DOMParser
+  // 3. Fallback: DOMParser with getElementsByTagName (namespace-agnostic)
   try {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xml, "text/xml");
-    const textEls = Array.from(doc.querySelectorAll("text"));
+    const textEls = Array.from(doc.getElementsByTagName("text"));
 
     if (textEls.length > 0) {
       for (const el of textEls) {
@@ -604,7 +614,7 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
         });
       }
     } else {
-      const pEls = Array.from(doc.querySelectorAll("p"));
+      const pEls = Array.from(doc.getElementsByTagName("p"));
       for (const el of pEls) {
         const startMs = Number(el.getAttribute("t"));
         const durMs = Number(el.getAttribute("d") ?? 0);
@@ -745,6 +755,32 @@ function parseTranscriptBody(body: string): TranscriptSegment[] {
   return [];
 }
 
+async function fetchCaptionText(url: string): Promise<string | null> {
+  // 1. Try background service worker fetch (bypasses all page CORS and CSP restrictions)
+  try {
+    const bgRes = (await chrome.runtime.sendMessage({
+      type: "FETCH_CAPTION_URL",
+      url,
+    })) as { success?: boolean; text?: string };
+    if (bgRes?.success && bgRes.text && bgRes.text.trim()) {
+      return bgRes.text;
+    }
+  } catch {}
+
+  // 2. Direct page fetch fallback
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const text = await res.text();
+      if (text && text.trim()) {
+        return text;
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 function extractSegmentsFromDom(): TranscriptSegment[] {
   const segmentElements = Array.from(
     document.querySelectorAll<HTMLElement>(
@@ -802,26 +838,9 @@ function extractSegmentsFromDom(): TranscriptSegment[] {
   return results;
 }
 
-function findAndClickShowTranscriptButton(): boolean {
-  if (document.querySelector("ytd-transcript-segment-renderer")) {
-    return true;
-  }
-
-  // 1. Direct transcript button in description
-  const directBtn = document.querySelector<HTMLElement>(
-    "ytd-video-description-transcript-section-renderer button, " +
-    "ytd-video-description-transcript-section-renderer ytd-button-renderer, " +
-    "button[aria-label*='transcript' i], " +
-    "button[aria-label*='Transcript' i]",
-  );
-  if (directBtn) {
-    directBtn.click();
-    return true;
-  }
-
-  // 2. If description is collapsed, click "more" / expand
+function expandDescription(): void {
   const expandBtn = document.querySelector<HTMLElement>(
-    "#expand, #description-inline-expander #expand, tp-yt-paper-button#expand",
+    "#expand, #description-inline-expander #expand, tp-yt-paper-button#expand, [id='expand']",
   );
   if (expandBtn && expandBtn.offsetParent !== null) {
     try {
@@ -829,63 +848,103 @@ function findAndClickShowTranscriptButton(): boolean {
     } catch {}
   }
 
-  // 3. Search buttons in description
+  const desc = document.querySelector<HTMLElement>(
+    "#description, #description-inline-expander, ytd-watch-metadata #description",
+  );
+  if (desc && desc.getAttribute("collapsed") !== null) {
+    try {
+      desc.click();
+    } catch {}
+  }
+}
+
+function findShowTranscriptButton(): HTMLElement | null {
+  // 1. YouTube description transcript section button
+  const directBtn = document.querySelector<HTMLElement>(
+    "ytd-video-description-transcript-section-renderer button, " +
+    "ytd-video-description-transcript-section-renderer ytd-button-renderer, " +
+    "ytd-video-description-transcript-section-renderer tp-yt-paper-button, " +
+    "ytd-video-description-transcript-section-renderer",
+  );
+  if (directBtn) {
+    const innerBtn = directBtn.querySelector<HTMLElement>("button") || directBtn;
+    return innerBtn;
+  }
+
+  // 2. Button with transcript in aria-label
+  const ariaBtn = document.querySelector<HTMLElement>(
+    "button[aria-label*='transcript' i], button[aria-label*='Transcript' i]",
+  );
+  if (ariaBtn) {
+    return ariaBtn;
+  }
+
+  // 3. Search buttons inside description
   const description = document.querySelector("#description, #description-inline-expander, ytd-watch-metadata");
   if (description) {
     const buttons = Array.from(
-      description.querySelectorAll<HTMLElement>("button, ytd-button-renderer, tp-yt-paper-button"),
+      description.querySelectorAll<HTMLElement>("button, ytd-button-renderer, tp-yt-paper-button, [role='button']"),
     );
     for (const btn of buttons) {
       const text = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
       if (text.includes("transcript")) {
-        btn.click();
-        return true;
+        return btn;
       }
     }
   }
 
-  // 4. Try the "More actions" menu under the video
+  // 4. More actions menu under video
   const moreActionsBtn = document.querySelector<HTMLElement>(
     "#actions button[aria-label*='More' i], #actions-inner button[aria-label*='More' i]",
   );
   if (moreActionsBtn) {
     try {
       moreActionsBtn.click();
-      window.setTimeout(() => {
-        const items = Array.from(
-          document.querySelectorAll<HTMLElement>("ytd-menu-service-item-renderer, tp-yt-paper-item"),
-        );
-        for (const item of items) {
-          if ((item.textContent || "").toLowerCase().includes("transcript")) {
-            item.click();
-            break;
-          }
+      const items = Array.from(
+        document.querySelectorAll<HTMLElement>("ytd-menu-service-item-renderer, tp-yt-paper-item, ytd-menu-navigation-item-renderer"),
+      );
+      for (const item of items) {
+        if ((item.textContent || "").toLowerCase().includes("transcript")) {
+          return item;
         }
-      }, 100);
+      }
     } catch {}
   }
 
-  return false;
+  return null;
 }
 
-async function extractTranscriptFromDom(timeoutMs = 2500): Promise<TranscriptSegment[]> {
+async function extractTranscriptFromDom(timeoutMs = 3500): Promise<TranscriptSegment[]> {
   let segments = extractSegmentsFromDom();
   if (segments.length > 0) {
     return segments;
   }
 
-  findAndClickShowTranscriptButton();
+  expandDescription();
 
   const startTime = Date.now();
+  let clicked = false;
+
   while (Date.now() - startTime < timeoutMs) {
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
     segments = extractSegmentsFromDom();
     if (segments.length > 0) {
       return segments;
     }
+
+    if (!clicked) {
+      const btn = findShowTranscriptButton();
+      if (btn) {
+        btn.click();
+        clicked = true;
+      } else {
+        expandDescription();
+      }
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
   }
 
-  return [];
+  return extractSegmentsFromDom();
 }
 
 async function fetchCaptionTrack(
@@ -925,46 +984,14 @@ async function fetchCaptionTrack(
   } catch {}
 
   for (const url of variants) {
-    try {
-      const response = await fetch(url, {
-        credentials: "include",
-        signal: AbortSignal.timeout(5000),
-      });
-
-      if (!response.ok) {
-        continue;
-      }
-
-      const body = await response.text();
-      if (!body || !body.trim()) {
-        continue;
-      }
-
-      const segments = parseTranscriptBody(body);
+    const text = await fetchCaptionText(url);
+    if (text) {
+      const segments = parseTranscriptBody(text);
       if (segments.length > 0) {
         return segments;
       }
-    } catch {
-      // Try next variant
     }
   }
-
-  // Fallback: try rawBase with credentials: "omit" in case cookies interfered
-  try {
-    const response = await fetch(rawBase, {
-      credentials: "omit",
-      signal: AbortSignal.timeout(5000),
-    });
-    if (response.ok) {
-      const body = await response.text();
-      if (body && body.trim()) {
-        const segments = parseTranscriptBody(body);
-        if (segments.length > 0) {
-          return segments;
-        }
-      }
-    }
-  } catch {}
 
   throw new Error("YouTube returned an empty caption track.");
 }
@@ -976,20 +1003,7 @@ async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; langu
     throw new Error("No YouTube video detected.");
   }
 
-  // Tier 1: Try YouTube native DOM transcript (fast, already authenticated, 100% formatted)
-  try {
-    const domSegments = await extractTranscriptFromDom(1000);
-    if (domSegments.length > 0) {
-      return {
-        segments: domSegments,
-        language: "en",
-      };
-    }
-  } catch {
-    // Continue to network fetching
-  }
-
-  // Tier 2: Caption tracks from player response
+  // Tier 1: Caption tracks from player response (using background service worker fetch for 100% bypass of CORS/CSP)
   const tracks = await getCaptionTracks(videoId);
 
   if (tracks.length > 0) {
@@ -1013,18 +1027,16 @@ async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; langu
     }
   }
 
-  // Tier 3: DOM transcript retry with longer timeout (in case the panel took time to load from YouTube's server)
+  // Tier 2: YouTube native DOM transcript (in-page transcript panel)
   try {
-    const domSegments = await extractTranscriptFromDom(2500);
+    const domSegments = await extractTranscriptFromDom(3500);
     if (domSegments.length > 0) {
       return {
         segments: domSegments,
         language: "en",
       };
     }
-  } catch {
-    // Continue to error
-  }
+  } catch {}
 
   if (tracks.length === 0) {
     throw new Error(

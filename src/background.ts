@@ -342,6 +342,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "FETCH_CAPTION_URL" && typeof message.url === "string") {
+    fetch(message.url)
+      .then(async (res) => {
+        if (!res.ok) {
+          sendResponse({ success: false, status: res.status });
+          return;
+        }
+        const text = await res.text();
+        sendResponse({ success: true, text });
+      })
+      .catch((err) => {
+        sendResponse({ success: false, error: String(err) });
+      });
+    return true;
+  }
+
   return false;
 });
 
