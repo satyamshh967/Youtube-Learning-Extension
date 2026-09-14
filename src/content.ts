@@ -1157,3 +1157,16 @@ function detectNavigation(): void {
 document.addEventListener("yt-navigate-finish", detectNavigation);
 window.addEventListener("popstate", detectNavigation);
 window.setTimeout(notifyVideoChange, 1000);
+
+// Hide YouTube's native transcript/captions panel so only the extension UI is used
+(function hideYouTubeTranscriptPanel() {
+  const style = document.createElement("style");
+  style.textContent = `
+    /* Hide YouTube's transcript engagement panel */
+    ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"],
+    ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"][target-id="engagement-panel-searchable-transcript"] {
+      display: none !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+})();

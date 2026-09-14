@@ -12,17 +12,20 @@ import type {
   TranscriptionStatus,
 } from "./types/transcript";
 import {
-  generateVideoSummary,
-  extractKeyMoments,
-  extractHooks,
-  generateSuggestedChapters,
-  formatChaptersForExport,
   exportToSrt,
-  type SummaryResult,
-  type KeyMoment,
-  type VideoHook,
-  type Chapter,
+  formatTranscriptAsScript,
+  formatTranscriptWithTimestamps,
 } from "./utils/transcriptAnalysis";
+import {
+  getApiKey,
+  generateAIChapters,
+  generateAISummary,
+  formatAIChaptersForExport,
+  formatAIChaptersDetailedForExport,
+  formatAISummaryForExport,
+  type AIChapter,
+  type AISummary,
+} from "./utils/aiService";
 
 interface ActiveContext {
   tabId: number | null;
@@ -34,7 +37,7 @@ interface BackgroundResponse {
   context: ActiveContext;
 }
 
-type TabType = "transcript" | "summary" | "moments" | "hooks" | "chapters";
+type TabType = "transcript" | "summary" | "chapters";
 
 function formatTimestamp(seconds: number): string {
   const totalSeconds = Math.max(0, Math.floor(seconds));
@@ -63,6 +66,10 @@ function formatTimestampRange(start: number, end?: number): string {
 }
 
 function App() {
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    return (localStorage.getItem("yt_companion_theme") as "dark" | "light") || "dark";
+  });
+
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [transcript, setTranscript] = useState<Transcript | null>(null);
   const [loading, setLoading] = useState(false);
@@ -73,29 +80,67 @@ function App() {
     useState<TranscriptionStatus>("idle");
   const [activeTab, setActiveTab] = useState<TabType>("transcript");
 
-  // Search state
   const [searchQuery, setSearchQuery] = useState("");
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
 
-  // Analysis state
-  const [summary, setSummary] = useState<SummaryResult | null>(null);
-  const [moments, setMoments] = useState<KeyMoment[]>([]);
-  const [hooks, setHooks] = useState<VideoHook[]>([]);
-  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [summary, setSummary] = useState<AISummary | null>(null);
+  const [chapters, setChapters] = useState<AIChapter[]>([]);
+
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    localStorage.setItem("yt_companion_theme", next);
+  };
 
   const showCopied = (msg = "Copied to clipboard") => {
     setCopiedMessage(msg);
     setTimeout(() => setCopiedMessage(null), 2000);
   };
 
-  const populateAnalysis = useCallback((currTranscript: Transcript) => {
-    setSummary(generateVideoSummary(currTranscript));
-    setMoments(extractKeyMoments(currTranscript));
-    setHooks(extractHooks(currTranscript));
-    setChapters(generateSuggestedChapters(currTranscript));
-  }, []);
+  const populateAnalysis = useCallback(
+    async (currTranscript: Transcript) => {
+      setSummary(null);
+      setChapters([]);
+
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        setAiError("No Gemini API key configured. Set VITE_GEMINI_API_KEY in your .env file to enable AI summary & chapters.");
+        return;
+      }
+
+      setAiLoading(true);
+      setAiError(null);
+
+      try {
+        const [aiSummary, aiChapters] = await Promise.all([
+          generateAISummary(
+            currTranscript.segments,
+            currTranscript.title || video?.title || "Video",
+          ),
+          generateAIChapters(
+            currTranscript.segments,
+            currTranscript.title || video?.title || "Video",
+            currTranscript.duration ?? video?.duration,
+          ),
+        ]);
+
+        setSummary(aiSummary);
+        setChapters(aiChapters);
+      } catch (err) {
+        setAiError(
+          err instanceof Error ? err.message : "AI generation failed. Please try again.",
+        );
+      } finally {
+        setAiLoading(false);
+      }
+    },
+    [video?.title, video?.duration],
+  );
 
   const restoreTranscript = useCallback(
     async (videoId: string) => {
@@ -118,8 +163,6 @@ function App() {
 
         setTranscript(null);
         setSummary(null);
-        setMoments([]);
-        setHooks([]);
         setChapters([]);
         setTranscriptionState("idle");
       } catch {
@@ -147,18 +190,17 @@ function App() {
       setVideo(nextVideo);
 
       if (isDifferentVideo) {
-        // Video changed: reset all previous video states immediately
         setError(null);
         setTranscript(null);
         setSummary(null);
-        setMoments([]);
-        setHooks([]);
         setChapters([]);
         setSearchQuery("");
         setActiveMatchIdx(0);
         setLoading(false);
         setTranscriptionState("idle");
         setActiveTab("transcript");
+        setAiError(null);
+        setAiLoading(false);
         await restoreTranscript(nextVideo.id);
       }
     },
@@ -242,7 +284,6 @@ function App() {
     }
   };
 
-  // Search matching indices
   const matchingIndices = useMemo(() => {
     if (!transcript || !searchQuery.trim()) return [];
     const q = searchQuery.toLowerCase().trim();
@@ -277,90 +318,116 @@ function App() {
     scrollToSegment(matchingIndices[prevIdx]);
   };
 
-  // Export handlers
-  const copyFullTranscript = () => {
-    if (!transcript) return;
-    const text = transcript.segments
-      .map((s) => `${formatTimestampRange(s.start, s.end)} ${s.text}`)
-      .join("\n");
-    navigator.clipboard.writeText(text).then(() => {
-      showCopied("Transcript copied");
-    });
+  const clearAll = () => {
+    setTranscript(null);
+    setSummary(null);
+    setChapters([]);
+    setTranscriptionState("idle");
+    setSearchQuery("");
+    setActiveMatchIdx(0);
+    setAiError(null);
   };
 
-  const copySelectedText = () => {
-    const sel = window.getSelection()?.toString();
-    if (sel && sel.trim()) {
-      navigator.clipboard.writeText(sel).then(() => {
-        showCopied("Selection copied");
-      });
-    } else {
-      copyFullTranscript();
+  const retryAI = () => {
+    if (transcript) {
+      populateAnalysis(transcript);
     }
   };
 
-  const downloadTxt = () => {
+  const copyTranscriptScript = () => {
+    if (!transcript) return;
+    const text = formatTranscriptAsScript(transcript.segments);
+    navigator.clipboard.writeText(text).then(() => {
+      showCopied("Script copied (clean text)");
+    });
+  };
+
+  const copyTranscriptWithTimestamps = () => {
+    if (!transcript) return;
+    const text = formatTranscriptWithTimestamps(transcript.segments);
+    navigator.clipboard.writeText(text).then(() => {
+      showCopied("Timestamps copied");
+    });
+  };
+
+  const downloadTranscriptTxt = () => {
     if (!transcript) return;
     const title = video?.title || "youtube-transcript";
-    const text = [
-      `Title: ${title}`,
-      `Video ID: ${transcript.videoId}`,
-      `Source: ${transcript.source || "youtube_captions"}`,
-      `Language: ${transcript.language || "auto"}`,
-      "",
-      ...transcript.segments.map(
-        (s) => `${formatTimestampRange(s.start, s.end)} ${s.text}`,
-      ),
-    ].join("\n");
-
+    const cleanTitle = title.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+    const text = formatTranscriptAsScript(transcript.segments);
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_transcript.txt`;
+    a.download = `${cleanTitle}_script.txt`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const downloadSrt = () => {
+  const downloadTranscriptSrt = () => {
     if (!transcript) return;
     const title = video?.title || "youtube-transcript";
+    const cleanTitle = title.replace(/[^a-z0-9]/gi, "_").toLowerCase();
     const srtContent = exportToSrt(transcript.segments);
     const blob = new Blob([srtContent], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_subtitles.srt`;
+    a.download = `${cleanTitle}_subtitles.srt`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
   const copySummaryText = () => {
     if (!summary) return;
-    const text = [
-      `OVERVIEW:`,
-      summary.overview,
-      "",
-      `MAIN POINTS:`,
-      ...summary.mainPoints.map((p) => `• ${p}`),
-      "",
-      `IMPORTANT EXPLANATIONS:`,
-      ...summary.importantExplanations.map((e) => `• ${e}`),
-      "",
-      `KEY CONCLUSIONS:`,
-      ...summary.keyConclusions.map((c) => `• ${c}`),
-    ].join("\n");
-
+    const text = formatAISummaryForExport(summary, video?.title);
     navigator.clipboard.writeText(text).then(() => {
-      showCopied("Summary copied");
+      showCopied("Summary copied (Markdown)");
     });
   };
 
-  const copyChaptersText = () => {
-    const text = formatChaptersForExport(chapters);
+  const downloadSummaryMd = () => {
+    if (!summary) return;
+    const title = video?.title || "youtube-summary";
+    const cleanTitle = title.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+    const text = formatAISummaryForExport(summary, video?.title);
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${cleanTitle}_summary.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const copyChaptersYouTube = () => {
+    if (chapters.length === 0) return;
+    const text = formatAIChaptersForExport(chapters);
     navigator.clipboard.writeText(text).then(() => {
-      showCopied("Chapters copied");
+      showCopied("YouTube timestamps copied");
     });
+  };
+
+  const copyChaptersDetailed = () => {
+    if (chapters.length === 0) return;
+    const text = formatAIChaptersDetailedForExport(chapters, video?.title);
+    navigator.clipboard.writeText(text).then(() => {
+      showCopied("Chapters with details copied");
+    });
+  };
+
+  const downloadChaptersTxt = () => {
+    if (chapters.length === 0) return;
+    const title = video?.title || "youtube-chapters";
+    const cleanTitle = title.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+    const text = formatAIChaptersDetailedForExport(chapters, video?.title);
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${cleanTitle}_chapters.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const updateChapterTitle = (id: string, newTitle: string) => {
@@ -414,7 +481,6 @@ function App() {
           return;
         }
 
-        // Prevent stale responses for a different video
         if (message.videoId && message.videoId !== video.id) {
           return;
         }
@@ -507,7 +573,6 @@ function App() {
   const hasFiniteDuration =
     typeof video?.duration === "number" && video.duration > 0;
 
-  // Highlight matching text in transcript
   const renderHighlightedText = (text: string, isCurrentMatch: boolean) => {
     if (!searchQuery.trim()) {
       return text;
@@ -530,23 +595,36 @@ function App() {
   };
 
   return (
-    <div className="app">
+    <div className={`app ${theme}`}>
       <header className="header">
-        <div>
-          <div className="eyebrow">LEARNING COMPANION</div>
-          <h1>YouTube Companion</h1>
+        <div className="header-brand">
+          <div className="brand-badge">⚡</div>
+          <div>
+            <div className="eyebrow">SMART LEARNING</div>
+            <h1>YouTube Companion</h1>
+          </div>
         </div>
+
         <div className="header-right">
           {copiedMessage && <span className="copied-pill">✓ {copiedMessage}</span>}
+          
+          <button
+            className="theme-toggle-btn"
+            onClick={toggleTheme}
+            title={`Switch to ${theme === "dark" ? "Light" : "Dark"} Mode`}
+          >
+            {theme === "dark" ? "☀️" : "🌙"}
+          </button>
+
           <span
             className={`status-dot ${
-              loading
+              loading || aiLoading
                 ? "status-dot-processing"
                 : transcriptionState === "completed"
                   ? "status-dot-completed"
                   : ""
             }`}
-            title={`Status: ${transcriptionState}`}
+            title={`Status: ${loading ? "Retrieving transcript..." : aiLoading ? "Generating AI analysis..." : transcriptionState}`}
           />
         </div>
       </header>
@@ -554,466 +632,504 @@ function App() {
       <main className="content">
         {!video ? (
           <section className="home">
-            <div className="home-icon">▶</div>
-            <div className="eyebrow">YOUR LEARNING SPACE</div>
-            <h2>
-              Learn from
-              <br />
-              any video.
-            </h2>
+            <div className="home-icon">✨</div>
+            <div className="eyebrow">YOUR SMART ASSISTANT</div>
+            <h2>Learn faster from any video.</h2>
             <p>
-              Open any YouTube video to instantly retrieve complete transcripts,
-              search through dialogue, generate summaries, and study key moments.
+              Open any YouTube video to retrieve complete transcripts, search dialogue,
+              generate AI-powered structured summaries, and explore smart chapters.
             </p>
 
             <div className="feature-list">
-              <div className="feature">
-                <span>01</span>
+              <div className="feature-item">
+                <span className="feature-num">01</span>
                 <div>
-                  <strong>Instant Complete Transcripts</strong>
-                  <small>
-                    Retrieves full video transcript even when paused.
-                  </small>
+                  <strong>Full Instant Transcripts</strong>
+                  <small>Read the complete spoken script without video pauses.</small>
                 </div>
               </div>
-              <div className="feature">
-                <span>02</span>
+              <div className="feature-item">
+                <span className="feature-num">02</span>
                 <div>
-                  <strong>Clickable Timestamps & Search</strong>
-                  <small>
-                    Highlight keywords and jump anywhere in the video.
-                  </small>
+                  <strong>AI Smart Summaries</strong>
+                  <small>Deep overview, key bullet points, explanations, and takeaways.</small>
                 </div>
               </div>
-              <div className="feature">
-                <span>03</span>
+              <div className="feature-item">
+                <span className="feature-num">03</span>
                 <div>
-                  <strong>Structured Summaries & Chapters</strong>
-                  <small>
-                    Study notes, key moments, and chapter exports.
-                  </small>
+                  <strong>Intelligent Chapters & Search</strong>
+                  <small>Search topics and jump to exact timestamps effortlessly.</small>
                 </div>
               </div>
             </div>
 
-            <div className="home-hint">Open a YouTube video to get started.</div>
+            <div className="home-hint">💡 Open a YouTube video tab to begin learning.</div>
           </section>
         ) : (
           <>
             <section className="video-card">
               <div className="video-card-top">
-                <div className="label">CURRENT VIDEO</div>
-                {hasFiniteDuration && (
-                  <span className="duration-pill">
-                    ⏱ {formatTimestamp(video.duration!)}
-                  </span>
-                )}
+                <span className="video-source-badge">YOUTUBE VIDEO</span>
+                <div className="video-badges-row">
+                  {hasFiniteDuration && (
+                    <span className="duration-pill">
+                      ⏱ {formatTimestamp(video.duration!)}
+                    </span>
+                  )}
+                  {video.hasCaptions !== undefined && (
+                    <span
+                      className={`caption-pill ${
+                        video.hasCaptions ? "has-caps" : "no-caps"
+                      }`}
+                    >
+                      {video.hasCaptions ? "CC Ready" : "No CC"}
+                    </span>
+                  )}
+                </div>
               </div>
 
               <h2>{video.title}</h2>
-
-              <div className="video-meta-row">
-                <span className="video-id">{video.id}</span>
-                {video.hasCaptions !== undefined && (
-                  <span
-                    className={`caption-pill ${
-                      video.hasCaptions ? "has-caps" : "no-caps"
-                    }`}
-                  >
-                    {video.hasCaptions ? "CC Available" : "No CC Detected"}
-                  </span>
-                )}
-              </div>
+              <span className="video-id">ID: {video.id}</span>
             </section>
 
-            <section className="section">
-              <div className="section-header">
-                <div>
-                  <div className="label">TRANSCRIPT</div>
-                  <h2>
-                    {transcript
-                      ? `${transcript.segments.length} segments`
-                      : "Full Video Transcript"}
-                  </h2>
-                </div>
-
-                {!transcript && (
-                  <div className="button-group">
-                    <button
-                      className="primary-button"
-                      onClick={showTranscription}
-                      disabled={loading}
-                      title="Show complete transcript for this video"
-                    >
-                      {loading ? "Getting transcript..." : "Show Transcription"}
-                    </button>
-                  </div>
-                )}
-
-                {transcript && (
-                  <div className="button-group">
-                    <button
-                      className="secondary-button"
-                      onClick={copyFullTranscript}
-                      title="Copy full transcript to clipboard"
-                    >
-                      Copy All
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={copySelectedText}
-                      title="Copy selected text or full transcript"
-                    >
-                      Copy Text
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={downloadTxt}
-                      title="Download transcript as text (.txt)"
-                    >
-                      .TXT
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={downloadSrt}
-                      title="Download subtitles with timestamps (.srt)"
-                    >
-                      .SRT
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={() => {
-                        setTranscript(null);
-                        setSummary(null);
-                        setMoments([]);
-                        setHooks([]);
-                        setChapters([]);
-                        setTranscriptionState("idle");
-                      }}
-                      title="Clear transcript view"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                )}
+            {!transcript && (
+              <div className="fetch-section">
+                <button
+                  className="primary-button full-width"
+                  onClick={showTranscription}
+                  disabled={loading}
+                >
+                  {loading ? (
+                    <>
+                      <div className="btn-spinner" />
+                      <span>{isSlowLoading ? "Still retrieving transcript..." : "Getting Transcript..."}</span>
+                    </>
+                  ) : (
+                    <span>🚀 Show Video Transcript & Analysis</span>
+                  )}
+                </button>
               </div>
+            )}
 
-              {/* Loading State: Honest, immediate, no fake progress */}
-              {loading && (
-                <div className="info-box processing-box">
-                  <div className="spinner" />
-                  <div>
-                    <strong>
-                      {isSlowLoading
-                        ? "Still retrieving the transcript..."
-                        : "Getting transcript..."}
-                    </strong>
-                    <p>Please wait.</p>
-                  </div>
+            {loading && !transcript && (
+              <div className="info-box processing-box">
+                <div className="spinner" />
+                <div>
+                  <strong>{isSlowLoading ? "Extracting full video audio..." : "Retrieving transcript..."}</strong>
+                  <p>Please wait a moment while we process the video content.</p>
                 </div>
-              )}
+              </div>
+            )}
 
-              {/* Persistent readable error */}
-              {error && !loading && (
-                <div className="error">
-                  <div className="error-title">Transcription Notice:</div>
-                  <div className="error-message">{error}</div>
+            {error && !loading && (
+              <div className="error-box">
+                <div className="error-title">Transcription Notice:</div>
+                <div className="error-message">{error}</div>
+              </div>
+            )}
+
+            {transcript && (
+              <section className="main-panel">
+                <div className="tab-nav">
+                  <button
+                    className={`tab-btn ${activeTab === "transcript" ? "active" : ""}`}
+                    onClick={() => setActiveTab("transcript")}
+                  >
+                    📝 Transcript ({transcript.segments.length})
+                  </button>
+                  <button
+                    className={`tab-btn ${activeTab === "summary" ? "active" : ""}`}
+                    onClick={() => setActiveTab("summary")}
+                  >
+                    ✨ AI Summary {aiLoading && <span className="tab-loading-dot" />}
+                  </button>
+                  <button
+                    className={`tab-btn ${activeTab === "chapters" ? "active" : ""}`}
+                    onClick={() => setActiveTab("chapters")}
+                  >
+                    📑 Chapters ({chapters.length})
+                  </button>
                 </div>
-              )}
 
-              {/* Feature Tabs once transcript is available */}
-              {transcript && (
-                <>
-                  <div className="tab-nav">
-                    <button
-                      className={`tab-btn ${activeTab === "transcript" ? "active" : ""}`}
-                      onClick={() => setActiveTab("transcript")}
-                    >
-                      Transcript
-                    </button>
-                    <button
-                      className={`tab-btn ${activeTab === "summary" ? "active" : ""}`}
-                      onClick={() => setActiveTab("summary")}
-                    >
-                      Summary
-                    </button>
-                    <button
-                      className={`tab-btn ${activeTab === "moments" ? "active" : ""}`}
-                      onClick={() => setActiveTab("moments")}
-                    >
-                      Key Moments ({moments.length})
-                    </button>
-                    <button
-                      className={`tab-btn ${activeTab === "hooks" ? "active" : ""}`}
-                      onClick={() => setActiveTab("hooks")}
-                    >
-                      Hooks ({hooks.length})
-                    </button>
-                    <button
-                      className={`tab-btn ${activeTab === "chapters" ? "active" : ""}`}
-                      onClick={() => setActiveTab("chapters")}
-                    >
-                      Chapters ({chapters.length})
-                    </button>
-                  </div>
-
-                  {/* TAB 1: TRANSCRIPT (With Search) */}
+                <div className="action-toolbar">
                   {activeTab === "transcript" && (
-                    <div className="tab-pane">
-                      {/* Search Bar */}
-                      <div className="search-bar">
-                        <span className="search-icon">🔍</span>
-                        <input
-                          ref={searchInputRef}
-                          type="text"
-                          className="search-input"
-                          placeholder="Search transcript..."
-                          value={searchQuery}
-                          onChange={(e) => {
-                            setSearchQuery(e.target.value);
-                            setActiveMatchIdx(0);
-                          }}
-                        />
-                        {searchQuery && (
-                          <>
-                            <span className="match-counter">
-                              {matchingIndices.length > 0
-                                ? `${activeMatchIdx + 1} of ${matchingIndices.length}`
-                                : "0 matches"}
-                            </span>
+                    <div className="button-group">
+                      <button
+                        className="action-btn primary-action"
+                        onClick={copyTranscriptScript}
+                        title="Copy transcript formatted as clean written script"
+                      >
+                        📋 Copy Script
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={copyTranscriptWithTimestamps}
+                        title="Copy transcript with timestamps"
+                      >
+                        ⏱️ With Timestamps
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={downloadTranscriptTxt}
+                        title="Download script as text file"
+                      >
+                        📄 .TXT
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={downloadTranscriptSrt}
+                        title="Download subtitles file"
+                      >
+                        💬 .SRT
+                      </button>
+                      <button
+                        className="action-btn danger-action"
+                        onClick={clearAll}
+                        title="Reset transcript"
+                      >
+                        ✕ Clear
+                      </button>
+                    </div>
+                  )}
+
+                  {activeTab === "summary" && (
+                    <div className="button-group">
+                      <button
+                        className="action-btn primary-action"
+                        onClick={copySummaryText}
+                        disabled={!summary || aiLoading}
+                        title="Copy summary in Markdown format"
+                      >
+                        📋 Copy Summary
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={downloadSummaryMd}
+                        disabled={!summary || aiLoading}
+                        title="Download summary as Markdown file"
+                      >
+                        📑 .MD
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={retryAI}
+                        disabled={aiLoading}
+                        title="Regenerate AI analysis"
+                      >
+                        🔄 {aiLoading ? "Generating..." : "Regenerate"}
+                      </button>
+                      <button
+                        className="action-btn danger-action"
+                        onClick={clearAll}
+                        title="Reset"
+                      >
+                        ✕ Clear
+                      </button>
+                    </div>
+                  )}
+
+                  {activeTab === "chapters" && (
+                    <div className="button-group">
+                      <button
+                        className="action-btn primary-action"
+                        onClick={copyChaptersYouTube}
+                        disabled={chapters.length === 0 || aiLoading}
+                        title="Copy YouTube description timestamps"
+                      >
+                        📋 Copy Timestamps
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={copyChaptersDetailed}
+                        disabled={chapters.length === 0 || aiLoading}
+                        title="Copy chapters with summaries"
+                      >
+                        📄 Copy Details
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={downloadChaptersTxt}
+                        disabled={chapters.length === 0 || aiLoading}
+                        title="Download chapters as text"
+                      >
+                        📑 .TXT
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={retryAI}
+                        disabled={aiLoading}
+                        title="Regenerate chapters"
+                      >
+                        🔄 {aiLoading ? "Generating..." : "Regenerate"}
+                      </button>
+                      <button
+                        className="action-btn danger-action"
+                        onClick={clearAll}
+                        title="Reset"
+                      >
+                        ✕ Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {activeTab === "transcript" && (
+                  <div className="tab-pane">
+                    <div className="search-bar">
+                      <span className="search-icon">🔍</span>
+                      <input
+                        ref={searchInputRef}
+                        type="text"
+                        className="search-input"
+                        placeholder="Search dialogue in transcript..."
+                        value={searchQuery}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setActiveMatchIdx(0);
+                        }}
+                      />
+                      {searchQuery && (
+                        <div className="search-controls">
+                          <span className="match-counter">
+                            {matchingIndices.length > 0
+                              ? `${activeMatchIdx + 1}/${matchingIndices.length}`
+                              : "0 matches"}
+                          </span>
+                          <button
+                            className="search-nav-btn"
+                            onClick={prevMatch}
+                            disabled={matchingIndices.length === 0}
+                            title="Previous match"
+                          >
+                            ▲
+                          </button>
+                          <button
+                            className="search-nav-btn"
+                            onClick={nextMatch}
+                            disabled={matchingIndices.length === 0}
+                            title="Next match"
+                          >
+                            ▼
+                          </button>
+                          <button
+                            className="clear-search-btn"
+                            onClick={() => {
+                              setSearchQuery("");
+                              setActiveMatchIdx(0);
+                            }}
+                            title="Clear search"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="transcript-list">
+                      {transcript.segments.map((segment, index) => {
+                        const isMatch =
+                          Boolean(searchQuery.trim()) &&
+                          matchingIndices.includes(index);
+                        const isCurrentMatch =
+                          isMatch &&
+                          matchingIndices[activeMatchIdx] === index;
+
+                        return (
+                          <div
+                            className={`segment-card ${isMatch ? "segment-matched" : ""} ${isCurrentMatch ? "segment-active-match" : ""}`}
+                            id={`seg-${index}`}
+                            key={`${segment.start}-${index}`}
+                          >
                             <button
-                              className="search-nav-btn"
-                              onClick={prevMatch}
-                              disabled={matchingIndices.length === 0}
-                              title="Previous match"
+                              className="segment-time-pill"
+                              onClick={() => seekTo(segment.start)}
+                              title="Jump to video timestamp"
                             >
-                              ▲
+                              ▶ {formatTimestamp(segment.start)}
                             </button>
-                            <button
-                              className="search-nav-btn"
-                              onClick={nextMatch}
-                              disabled={matchingIndices.length === 0}
-                              title="Next match"
-                            >
-                              ▼
-                            </button>
-                            <button
-                              className="clear-search-btn"
-                              onClick={() => {
-                                setSearchQuery("");
-                                setActiveMatchIdx(0);
-                              }}
-                              title="Clear search"
-                            >
-                              ✕
-                            </button>
-                          </>
+                            <p className="segment-text">
+                              {renderHighlightedText(
+                                segment.text,
+                                isCurrentMatch,
+                              )}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {activeTab === "summary" && (
+                  <div className="tab-pane summary-pane">
+                    {aiLoading && (
+                      <div className="ai-skeleton-container">
+                        <div className="ai-loading-status">
+                          <div className="ai-pulse-dot" />
+                          <span>Generating comprehensive AI summary with Gemini...</span>
+                        </div>
+                        <div className="skeleton-card">
+                          <div className="skeleton-line skeleton-title" />
+                          <div className="skeleton-line" />
+                          <div className="skeleton-line" />
+                          <div className="skeleton-line skeleton-short" />
+                        </div>
+                        <div className="skeleton-card">
+                          <div className="skeleton-line skeleton-title" />
+                          <div className="skeleton-line" />
+                          <div className="skeleton-line" />
+                          <div className="skeleton-line skeleton-short" />
+                        </div>
+                      </div>
+                    )}
+
+                    {aiError && !aiLoading && (
+                      <div className="ai-error-banner">
+                        <div className="ai-error-header">
+                          <span>⚠️ AI Generation Notice</span>
+                        </div>
+                        <p>{aiError}</p>
+                        <button className="retry-btn" onClick={retryAI}>
+                          🔄 Retry AI Generation
+                        </button>
+                      </div>
+                    )}
+
+                    {!aiLoading && !aiError && summary && (
+                      <div className="summary-cards">
+                        <div className="summary-card overview-card">
+                          <div className="card-header">
+                            <span className="card-icon">💡</span>
+                            <h3>Overview</h3>
+                          </div>
+                          <p className="summary-body">{summary.overview}</p>
+                        </div>
+
+                        {summary.mainPoints?.length > 0 && (
+                          <div className="summary-card">
+                            <div className="card-header">
+                              <span className="card-icon">🎯</span>
+                              <h3>Key Insights & Main Points</h3>
+                            </div>
+                            <ul className="styled-list">
+                              {summary.mainPoints.map((point, i) => (
+                                <li key={i}>
+                                  <span className="list-bullet">•</span>
+                                  <span>{point}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {summary.importantExplanations?.length > 0 && (
+                          <div className="summary-card">
+                            <div className="card-header">
+                              <span className="card-icon">🔍</span>
+                              <h3>Important Explanations & Deep Dive</h3>
+                            </div>
+                            <ul className="styled-list">
+                              {summary.importantExplanations.map((exp, i) => (
+                                <li key={i}>
+                                  <span className="list-bullet">›</span>
+                                  <span>{exp}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {summary.keyConclusions?.length > 0 && (
+                          <div className="summary-card conclusions-card">
+                            <div className="card-header">
+                              <span className="card-icon">🚀</span>
+                              <h3>Key Conclusions & Takeaways</h3>
+                            </div>
+                            <ul className="styled-list">
+                              {summary.keyConclusions.map((conc, i) => (
+                                <li key={i}>
+                                  <span className="list-bullet">✓</span>
+                                  <span>{conc}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
                         )}
                       </div>
+                    )}
 
-                      {/* Transcript Segments */}
-                      <div className="transcript">
-                        {transcript.segments.map((segment, index) => {
-                          const isMatch =
-                            Boolean(searchQuery.trim()) &&
-                            matchingIndices.includes(index);
-                          const isCurrentMatch =
-                            isMatch &&
-                            matchingIndices[activeMatchIdx] === index;
-
-                          return (
-                            <button
-                              className={`segment ${isMatch ? "segment-matched" : ""} ${isCurrentMatch ? "segment-active-match" : ""}`}
-                              id={`seg-${index}`}
-                              key={`${segment.start}-${index}`}
-                              onClick={() => seekTo(segment.start)}
-                              title="Click to seek video to this timestamp"
-                            >
-                              <span className="timestamp">
-                                {formatTimestampRange(segment.start, segment.end)}
-                              </span>
-                              <span className="segment-text">
-                                {renderHighlightedText(
-                                  segment.text,
-                                  isCurrentMatch,
-                                )}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* TAB 2: VIDEO SUMMARY */}
-                  {activeTab === "summary" && summary && (
-                    <div className="tab-pane summary-pane">
-                      <div className="pane-header">
-                        <div>
-                          <h3>Video Summary</h3>
-                          <p>Synthesized directly from retrieved transcript text.</p>
-                        </div>
-                        <button
-                          className="secondary-button"
-                          onClick={copySummaryText}
-                        >
-                          Copy Summary
+                    {!aiLoading && !aiError && !summary && (
+                      <div className="empty-panel">
+                        <span className="empty-icon">✨</span>
+                        <h3>No summary generated yet</h3>
+                        <p>Click the button below to generate AI summary.</p>
+                        <button className="primary-button" onClick={retryAI}>
+                          ⚡ Generate AI Summary
                         </button>
                       </div>
+                    )}
+                  </div>
+                )}
 
-                      <div className="summary-section">
-                        <h4>Overview</h4>
-                        <p className="summary-text">{summary.overview}</p>
-                      </div>
-
-                      <div className="summary-section">
-                        <h4>Main Points</h4>
-                        <ul className="summary-list">
-                          {summary.mainPoints.map((point, i) => (
-                            <li key={i}>{point}</li>
-                          ))}
-                        </ul>
-                      </div>
-
-                      <div className="summary-section">
-                        <h4>Important Explanations</h4>
-                        <ul className="summary-list">
-                          {summary.importantExplanations.map((exp, i) => (
-                            <li key={i}>{exp}</li>
-                          ))}
-                        </ul>
-                      </div>
-
-                      <div className="summary-section">
-                        <h4>Key Conclusions & Takeaways</h4>
-                        <ul className="summary-list">
-                          {summary.keyConclusions.map((conc, i) => (
-                            <li key={i}>{conc}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* TAB 3: KEY MOMENTS */}
-                  {activeTab === "moments" && (
-                    <div className="tab-pane moments-pane">
-                      <div className="pane-header">
-                        <div>
-                          <h3>Key Moments</h3>
-                          <p>Important definitions, examples, tips, and concepts.</p>
+                {activeTab === "chapters" && (
+                  <div className="tab-pane chapters-pane">
+                    {aiLoading && (
+                      <div className="ai-skeleton-container">
+                        <div className="ai-loading-status">
+                          <div className="ai-pulse-dot" />
+                          <span>Generating AI chapter breakdown...</span>
+                        </div>
+                        <div className="skeleton-card">
+                          <div className="skeleton-line skeleton-title" />
+                          <div className="skeleton-line" />
+                        </div>
+                        <div className="skeleton-card">
+                          <div className="skeleton-line skeleton-title" />
+                          <div className="skeleton-line" />
                         </div>
                       </div>
+                    )}
 
-                      <div className="cards-grid">
-                        {moments.map((moment) => (
-                          <div
-                            key={moment.id}
-                            className="moment-card"
-                            onClick={() => seekTo(moment.seconds)}
-                            title="Click to seek video"
-                          >
-                            <div className="card-top">
-                              <span
-                                className={`badge badge-${moment.category.toLowerCase().replace(/\s+/g, "-")}`}
-                              >
-                                {moment.category}
-                              </span>
-                              <span className="timestamp-badge">
-                                ▶ {moment.timestamp}
-                              </span>
-                            </div>
-                            <h4>{moment.title}</h4>
-                            <p className="card-explanation">
-                              {moment.explanation}
-                            </p>
-                            <blockquote className="card-quote">
-                              {moment.quote}
-                            </blockquote>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* TAB 4: FIND HOOKS */}
-                  {activeTab === "hooks" && (
-                    <div className="tab-pane hooks-pane">
-                      <div className="pane-header">
-                        <div>
-                          <h3>Find Hooks & Study Notes</h3>
-                          <p>
-                            Memorable insights and guiding questions from the
-                            transcript.
-                          </p>
+                    {aiError && !aiLoading && (
+                      <div className="ai-error-banner">
+                        <div className="ai-error-header">
+                          <span>⚠️ AI Chapters Notice</span>
                         </div>
-                      </div>
-
-                      <div className="cards-grid">
-                        {hooks.map((hook) => (
-                          <div
-                            key={hook.id}
-                            className="hook-card"
-                            onClick={() => seekTo(hook.seconds)}
-                            title="Click to seek video"
-                          >
-                            <div className="card-top">
-                              <span className="badge badge-quote">
-                                {hook.type}
-                              </span>
-                              <span className="timestamp-badge">
-                                ▶ {hook.timestamp}
-                              </span>
-                            </div>
-                            <p className="hook-quote">{hook.text}</p>
-                            <p className="hook-explanation">
-                              {hook.explanation}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* TAB 5: SUGGESTED CHAPTERS */}
-                  {activeTab === "chapters" && (
-                    <div className="tab-pane chapters-pane">
-                      <div className="pane-header">
-                        <div>
-                          <h3>Suggested Chapters</h3>
-                          <p>
-                            Generated timeline chapters. Click timestamp to seek,
-                            edit title, or copy for YouTube.
-                          </p>
-                        </div>
-                        <button
-                          className="secondary-button"
-                          onClick={copyChaptersText}
-                        >
-                          Copy Chapters
+                        <p>{aiError}</p>
+                        <button className="retry-btn" onClick={retryAI}>
+                          🔄 Retry AI Chapters
                         </button>
                       </div>
+                    )}
 
-                      <div className="chapters-list">
+                    {!aiLoading && !aiError && chapters.length > 0 && (
+                      <div className="chapters-timeline">
                         {chapters.map((chap) => (
-                          <div key={chap.id} className="chapter-row">
+                          <div key={chap.id} className="chapter-item">
                             <button
-                              className="chapter-time-btn"
+                              className="chapter-seek-pill"
                               onClick={() => seekTo(chap.startSeconds)}
-                              title="Click to seek video"
+                              title="Click to seek YouTube video"
                             >
                               ▶ {chap.timestamp}
                             </button>
-                            <input
-                              type="text"
-                              className="chapter-title-input"
-                              value={chap.title}
-                              onChange={(e) =>
-                                updateChapterTitle(chap.id, e.target.value)
-                              }
-                            />
+                            <div className="chapter-body">
+                              <input
+                                type="text"
+                                className="chapter-title-edit"
+                                value={chap.title}
+                                onChange={(e) =>
+                                  updateChapterTitle(chap.id, e.target.value)
+                                }
+                                title="Click to edit chapter title"
+                              />
+                              {chap.summary && (
+                                <p className="chapter-desc">{chap.summary}</p>
+                              )}
+                            </div>
                             <button
-                              className="chapter-delete-btn"
+                              className="chapter-remove-btn"
                               onClick={() => deleteChapter(chap.id)}
                               title="Delete chapter"
                             >
@@ -1022,11 +1138,22 @@ function App() {
                           </div>
                         ))}
                       </div>
-                    </div>
-                  )}
-                </>
-              )}
-            </section>
+                    )}
+
+                    {!aiLoading && !aiError && chapters.length === 0 && (
+                      <div className="empty-panel">
+                        <span className="empty-icon">📑</span>
+                        <h3>No chapters generated yet</h3>
+                        <p>Click below to generate intelligent chapters with timestamps.</p>
+                        <button className="primary-button" onClick={retryAI}>
+                          ⚡ Generate AI Chapters
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+            )}
           </>
         )}
       </main>
