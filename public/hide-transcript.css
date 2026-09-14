@@ -1,0 +1,21 @@
+ytd-engagement-panel-section-list-renderer[target-id*="transcript"],
+ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"],
+ytd-engagement-panel-section-list-renderer:has(ytd-transcript-renderer),
+ytd-engagement-panel-section-list-renderer:has(ytd-transcript-search-panel-renderer),
+ytd-transcript-renderer,
+ytd-transcript-search-panel-renderer,
+ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"][target-id*="transcript"],
+#panels ytd-engagement-panel-section-list-renderer[target-id*="transcript"] {
+  display: none !important;
+  visibility: hidden !important;
+  width: 0 !important;
+  height: 0 !important;
+  max-height: 0 !important;
+  max-width: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  position: absolute !important;
+  top: -9999px !important;
+  left: -9999px !important;
+  z-index: -9999 !important;
+}

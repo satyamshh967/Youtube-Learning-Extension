@@ -1,5 +1,36 @@
 import type { VideoInfo, TranscriptSegment } from "./types/transcript";
 
+(function injectHideTranscriptPanelStyle(): void {
+  const existing = document.getElementById("__yt_hide_native_transcript__");
+  if (existing) return;
+  const style = document.createElement("style");
+  style.id = "__yt_hide_native_transcript__";
+  style.textContent = `
+    ytd-engagement-panel-section-list-renderer[target-id*="transcript"],
+    ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"],
+    ytd-engagement-panel-section-list-renderer:has(ytd-transcript-renderer),
+    ytd-engagement-panel-section-list-renderer:has(ytd-transcript-search-panel-renderer),
+    ytd-transcript-renderer,
+    ytd-transcript-search-panel-renderer,
+    ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"][target-id*="transcript"],
+    #panels ytd-engagement-panel-section-list-renderer[target-id*="transcript"] {
+      display: none !important;
+      visibility: hidden !important;
+      width: 0 !important;
+      height: 0 !important;
+      max-height: 0 !important;
+      max-width: 0 !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      position: absolute !important;
+      top: -9999px !important;
+      left: -9999px !important;
+      z-index: -9999 !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+})();
+
 interface ExtensionMessage {
   type: string;
   time?: number;
@@ -54,6 +85,20 @@ function getVideoTitle(): string {
   }
 
   return "YouTube Video";
+}
+
+function getVideoDescription(): string {
+  const descEl = document.querySelector<HTMLElement>(
+    "#description-inline-expander, ytd-watch-metadata #description, #description",
+  );
+  return descEl?.textContent?.trim() || "";
+}
+
+function getVideoChannel(): string {
+  const channelEl = document.querySelector<HTMLElement>(
+    "#channel-name, ytd-channel-name, #owner #text, #upload-info #channel-name",
+  );
+  return channelEl?.textContent?.trim() || "";
 }
 
 function extractJsonObject(source: string, marker: string): unknown {
@@ -195,7 +240,6 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
     return playerResponseCache.get(currentId);
   }
 
-  // 1. Try accessing player response from main world (most accurate for SPA & live state)
   try {
     const mainWorldResponse = await getPlayerResponseFromMainWorld();
     if (mainWorldResponse?.videoDetails?.videoId === currentId) {
@@ -204,7 +248,6 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
     }
   } catch {}
 
-  // 2. Try extracting from current document scripts
   const scripts = Array.from(document.scripts);
   for (const script of scripts) {
     const content = script.textContent ?? "";
@@ -219,7 +262,6 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
     }
   }
 
-  // 3. If single-page navigation occurred or scripts didn't match, fetch the watch page HTML
   try {
     const watchUrl = `https://www.youtube.com/watch?v=${currentId}`;
     const res = await fetch(watchUrl, {
@@ -234,9 +276,7 @@ async function getPlayerResponse(targetVideoId?: string): Promise<any | null> {
         return response;
       }
     }
-  } catch {
-    // Network failure or timeout
-  }
+  } catch {}
 
   return null;
 }
@@ -277,6 +317,8 @@ function getVideoInfo(): VideoInfo {
     id: currentId,
     title: getVideoTitle(),
     url: window.location.href,
+    description: getVideoDescription(),
+    channelName: getVideoChannel(),
     duration: getVideoDuration(),
     currentTime,
     isPaused,
@@ -322,7 +364,7 @@ function attachVideoListeners(): void {
         currentTime: video.currentTime,
         duration: video.duration,
       })
-      .catch(() => { });
+      .catch(() => {});
   });
 
   video.addEventListener("pause", () => {
@@ -333,7 +375,7 @@ function attachVideoListeners(): void {
         currentTime: video.currentTime,
         duration: video.duration,
       })
-      .catch(() => { });
+      .catch(() => {});
   });
 
   video.addEventListener("durationchange", () => {
@@ -354,26 +396,27 @@ function notifyVideoChange(): void {
         type: "VIDEO_INFO_UPDATED",
         video: getVideoInfo(),
       })
-      .catch(() => { });
+      .catch(() => {});
 
     return;
   }
 
   attachVideoListeners();
 
-  // Pre-load player response for fast caption access
-  getPlayerResponse(videoId).then(() => {
-    waitForRealMetadata()
-      .then((video) => {
-        chrome.runtime
-          .sendMessage({
-            type: "VIDEO_INFO_UPDATED",
-            video,
-          })
-          .catch(() => { });
-      })
-      .catch(() => { });
-  }).catch(() => {});
+  getPlayerResponse(videoId)
+    .then(() => {
+      waitForRealMetadata()
+        .then((video) => {
+          chrome.runtime
+            .sendMessage({
+              type: "VIDEO_INFO_UPDATED",
+              video,
+            })
+            .catch(() => {});
+        })
+        .catch(() => {});
+    })
+    .catch(() => {});
 }
 
 async function getCaptionTracks(videoId?: string): Promise<CaptionTrack[]> {
@@ -399,7 +442,6 @@ function selectCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
     return null;
   }
 
-  // 1. English manual captions
   const englishManual = tracks.find(
     (track) =>
       (track.languageCode === "en" || track.languageCode?.startsWith("en-")) &&
@@ -409,7 +451,6 @@ function selectCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
     return englishManual;
   }
 
-  // 2. English auto-generated captions (ASR)
   const englishAsr = tracks.find(
     (track) =>
       track.languageCode === "en" || track.languageCode?.startsWith("en-"),
@@ -418,13 +459,11 @@ function selectCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
     return englishAsr;
   }
 
-  // 3. Any manual captions in other languages
   const manual = tracks.find((track) => track.kind !== "asr");
   if (manual) {
     return manual;
   }
 
-  // 4. Default fallback track
   return tracks[0];
 }
 
@@ -512,7 +551,6 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
   const results: TranscriptSegment[] = [];
   let lastText = "";
 
-  // 1. Regex on <text ...>...</text> (handles attributes in any order)
   const textMatches = Array.from(
     xml.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi),
   );
@@ -549,7 +587,6 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
     }
   }
 
-  // 2. Regex on <p ...>...</p> (SRV3 format, handles attributes in any order)
   const pMatches = Array.from(
     xml.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi),
   );
@@ -587,7 +624,6 @@ function parseXmlTranscript(xml: string): TranscriptSegment[] {
     }
   }
 
-  // 3. Fallback: DOMParser with getElementsByTagName (namespace-agnostic)
   try {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xml, "text/xml");
@@ -719,7 +755,6 @@ function parseTranscriptBody(body: string): TranscriptSegment[] {
 
   const trimmed = body.trim();
 
-  // 1. JSON3 format
   if (trimmed.startsWith("{")) {
     try {
       const data = JSON.parse(trimmed);
@@ -730,7 +765,6 @@ function parseTranscriptBody(body: string): TranscriptSegment[] {
     } catch {}
   }
 
-  // 2. WebVTT format
   if (trimmed.startsWith("WEBVTT") || trimmed.includes("-->")) {
     const segs = parseVttTranscript(trimmed);
     if (segs.length > 0) {
@@ -738,7 +772,6 @@ function parseTranscriptBody(body: string): TranscriptSegment[] {
     }
   }
 
-  // 3. XML format (Legacy or SRV3)
   if (
     trimmed.startsWith("<") ||
     trimmed.includes("<transcript") ||
@@ -756,7 +789,6 @@ function parseTranscriptBody(body: string): TranscriptSegment[] {
 }
 
 async function fetchCaptionText(url: string): Promise<string | null> {
-  // 1. Try background service worker fetch (bypasses all page CORS and CSP restrictions)
   try {
     const bgRes = (await chrome.runtime.sendMessage({
       type: "FETCH_CAPTION_URL",
@@ -767,7 +799,6 @@ async function fetchCaptionText(url: string): Promise<string | null> {
     }
   } catch {}
 
-  // 2. Direct page fetch fallback
   try {
     const res = await fetch(url);
     if (res.ok) {
@@ -781,10 +812,46 @@ async function fetchCaptionText(url: string): Promise<string | null> {
   return null;
 }
 
+function closeTranscriptPanel(): void {
+  try {
+    const closeBtn = document.querySelector<HTMLElement>(
+      'ytd-engagement-panel-section-list-renderer[target-id*="transcript"] #visibility-button button, ' +
+      'ytd-engagement-panel-section-list-renderer[target-id*="transcript"] button[aria-label*="Close" i], ' +
+      'ytd-engagement-panel-section-list-renderer[target-id*="transcript"] [id="visibility-button"]'
+    );
+    if (closeBtn) {
+      closeBtn.click();
+    }
+    const panels = document.querySelectorAll<HTMLElement>(
+      'ytd-engagement-panel-section-list-renderer[target-id*="transcript"]'
+    );
+    panels.forEach((p) => {
+      p.setAttribute("visibility", "ENGAGEMENT_PANEL_VISIBILITY_HIDDEN");
+      p.style.setProperty("display", "none", "important");
+    });
+  } catch {}
+}
+
+const panelObserver = new MutationObserver(() => {
+  const openPanels = document.querySelectorAll<HTMLElement>(
+    'ytd-engagement-panel-section-list-renderer[target-id*="transcript"][visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"], ' +
+    'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]'
+  );
+  if (openPanels.length > 0) {
+    closeTranscriptPanel();
+  }
+});
+panelObserver.observe(document.documentElement, {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ["visibility"],
+});
+
 function extractSegmentsFromDom(): TranscriptSegment[] {
   const segmentElements = Array.from(
     document.querySelectorAll<HTMLElement>(
-      "ytd-transcript-segment-renderer, ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer",
+      "ytd-transcript-segment-renderer, ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer, .ytd-transcript-segment-list-renderer ytd-transcript-segment-renderer, [class*='transcript-segment']"
     ),
   );
 
@@ -796,22 +863,24 @@ function extractSegmentsFromDom(): TranscriptSegment[] {
   let lastText = "";
 
   for (const el of segmentElements) {
-    const tsEl = el.querySelector<HTMLElement>(
-      ".segment-timestamp, [class*='segment-timestamp'], .yt-core-attributed-string",
-    );
-    const textEl = el.querySelector<HTMLElement>(
-      ".segment-text, [class*='segment-text']",
-    );
+    const fullText = el.textContent || "";
+    const timeMatch = fullText.match(/(\d{1,2}:)?\d{2}:\d{2}/);
+    let tsText = timeMatch ? timeMatch[0] : "";
 
-    let tsText = (tsEl?.textContent || "").trim();
-    const match = tsText.match(/(\d{1,2}:)?\d{2}:\d{2}/);
-    if (match) {
-      tsText = match[0];
+    const tsEl = el.querySelector<HTMLElement>(
+      ".segment-timestamp, [class*='segment-timestamp'], [class*='timestamp'], .yt-core-attributed-string, yt-formatted-string"
+    );
+    if (!tsText && tsEl?.textContent) {
+      tsText = tsEl.textContent.trim();
     }
 
-    let text = (textEl?.textContent || "").trim();
+    const textEl = el.querySelector<HTMLElement>(
+      ".segment-text, [class*='segment-text'], yt-formatted-string.segment-text, .yt-core-attributed-string--link-inherit-color"
+    );
+
+    let text = textEl?.textContent?.trim() || "";
     if (!text && tsText) {
-      text = (el.textContent || "").replace(tsText, "").trim();
+      text = fullText.replace(tsText, "").trim();
     }
 
     text = decodeHtmlEntities(text).replace(/\s+/g, " ").trim();
@@ -859,7 +928,6 @@ function expandDescription(): void {
 }
 
 function findShowTranscriptButton(): HTMLElement | null {
-  // 1. YouTube description transcript section button
   const directBtn = document.querySelector<HTMLElement>(
     "ytd-video-description-transcript-section-renderer button, " +
     "ytd-video-description-transcript-section-renderer ytd-button-renderer, " +
@@ -871,7 +939,6 @@ function findShowTranscriptButton(): HTMLElement | null {
     return innerBtn;
   }
 
-  // 2. Button with transcript in aria-label
   const ariaBtn = document.querySelector<HTMLElement>(
     "button[aria-label*='transcript' i], button[aria-label*='Transcript' i]",
   );
@@ -879,7 +946,6 @@ function findShowTranscriptButton(): HTMLElement | null {
     return ariaBtn;
   }
 
-  // 3. Search buttons inside description
   const description = document.querySelector("#description, #description-inline-expander, ytd-watch-metadata");
   if (description) {
     const buttons = Array.from(
@@ -893,7 +959,6 @@ function findShowTranscriptButton(): HTMLElement | null {
     }
   }
 
-  // 4. More actions menu under video
   const moreActionsBtn = document.querySelector<HTMLElement>(
     "#actions button[aria-label*='More' i], #actions-inner button[aria-label*='More' i]",
   );
@@ -915,36 +980,45 @@ function findShowTranscriptButton(): HTMLElement | null {
 }
 
 async function extractTranscriptFromDom(timeoutMs = 3500): Promise<TranscriptSegment[]> {
-  let segments = extractSegmentsFromDom();
-  if (segments.length > 0) {
-    return segments;
-  }
-
-  expandDescription();
-
-  const startTime = Date.now();
-  let clicked = false;
-
-  while (Date.now() - startTime < timeoutMs) {
-    segments = extractSegmentsFromDom();
+  try {
+    let segments = extractSegmentsFromDom();
     if (segments.length > 0) {
+      closeTranscriptPanel();
       return segments;
     }
 
-    if (!clicked) {
-      const btn = findShowTranscriptButton();
-      if (btn) {
-        btn.click();
-        clicked = true;
-      } else {
-        expandDescription();
+    expandDescription();
+
+    const startTime = Date.now();
+    let clicked = false;
+
+    while (Date.now() - startTime < timeoutMs) {
+      segments = extractSegmentsFromDom();
+      if (segments.length > 0) {
+        closeTranscriptPanel();
+        return segments;
       }
+
+      if (!clicked) {
+        const btn = findShowTranscriptButton();
+        if (btn) {
+          btn.click();
+          clicked = true;
+        } else {
+          expandDescription();
+        }
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
     }
 
-    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    const finalSegments = extractSegmentsFromDom();
+    closeTranscriptPanel();
+    return finalSegments;
+  } catch {
+    closeTranscriptPanel();
+    return [];
   }
-
-  return extractSegmentsFromDom();
 }
 
 async function fetchCaptionTrack(
@@ -952,11 +1026,6 @@ async function fetchCaptionTrack(
 ): Promise<TranscriptSegment[]> {
   const rawBase = track.baseUrl.replace(/&amp;/g, "&");
 
-  // Create list of URLs to try:
-  // 1. Raw unmodified baseUrl (signature is valid for this exact URL)
-  // 2. fmt=srv3 (XML v3 format)
-  // 3. fmt=vtt (WebVTT format)
-  // 4. fmt=json3 (JSON3 format)
   const variants: string[] = [rawBase];
 
   try {
@@ -1003,7 +1072,6 @@ async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; langu
     throw new Error("No YouTube video detected.");
   }
 
-  // Tier 1: Caption tracks from player response (using background service worker fetch for 100% bypass of CORS/CSP)
   const tracks = await getCaptionTracks(videoId);
 
   if (tracks.length > 0) {
@@ -1027,7 +1095,6 @@ async function fetchTranscript(): Promise<{ segments: TranscriptSegment[]; langu
     }
   }
 
-  // Tier 2: YouTube native DOM transcript (in-page transcript panel)
   try {
     const domSegments = await extractTranscriptFromDom(3500);
     if (domSegments.length > 0) {
@@ -1058,15 +1125,12 @@ function seekVideo(time: number): boolean {
 
   video.currentTime = time;
 
-  // Also seek YouTube custom player if exposed
   try {
     const moviePlayer = document.getElementById("movie_player") as any;
     if (typeof moviePlayer?.seekTo === "function") {
       moviePlayer.seekTo(time, true);
     }
-  } catch {
-    // Ignore
-  }
+  } catch {}
 
   return true;
 }
@@ -1157,16 +1221,3 @@ function detectNavigation(): void {
 document.addEventListener("yt-navigate-finish", detectNavigation);
 window.addEventListener("popstate", detectNavigation);
 window.setTimeout(notifyVideoChange, 1000);
-
-// Hide YouTube's native transcript/captions panel so only the extension UI is used
-(function hideYouTubeTranscriptPanel() {
-  const style = document.createElement("style");
-  style.textContent = `
-    /* Hide YouTube's transcript engagement panel */
-    ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"],
-    ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"][target-id="engagement-panel-searchable-transcript"] {
-      display: none !important;
-    }
-  `;
-  (document.head || document.documentElement).appendChild(style);
-})();

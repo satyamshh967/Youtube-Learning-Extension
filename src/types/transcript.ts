@@ -2,6 +2,8 @@ export interface VideoInfo {
   id: string | null;
   title: string;
   url: string;
+  description?: string;
+  channelName?: string;
   duration?: number | null;
   currentTime?: number;
   isPaused?: boolean;
@@ -21,7 +23,7 @@ export interface Transcript {
   title?: string;
   language?: string;
   languageProbability?: number;
-  source?: "youtube_captions" | "fallback";
+  source?: "youtube_captions" | "fallback" | "ai_generated";
   duration?: number | null;
   segments: TranscriptSegment[];
 }
@@ -31,10 +33,6 @@ export type TranscriptionStatus =
   | "loading"
   | "completed"
   | "failed";
-
-// ---------------------------------------------------------------------------
-// Typed events for extension message passing
-// ---------------------------------------------------------------------------
 
 interface EventBase {
   videoId?: string;

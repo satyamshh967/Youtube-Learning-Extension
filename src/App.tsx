@@ -20,6 +20,7 @@ import {
   getApiKey,
   generateAIChapters,
   generateAISummary,
+  generateAIScriptFallback,
   formatAIChaptersForExport,
   formatAIChaptersDetailedForExport,
   formatAISummaryForExport,
@@ -55,14 +56,6 @@ function formatTimestamp(seconds: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(
     remainingSeconds,
   ).padStart(2, "0")}`;
-}
-
-function formatTimestampRange(start: number, end?: number): string {
-  const startStr = formatTimestamp(start);
-  if (end !== undefined && end > start) {
-    return `[${startStr} - ${formatTimestamp(end)}]`;
-  }
-  return `[${startStr}]`;
 }
 
 function App() {
@@ -140,6 +133,64 @@ function App() {
       }
     },
     [video?.title, video?.duration],
+  );
+
+  const handleAIFallbackScript = useCallback(
+    async (targetVideo: VideoInfo) => {
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        setError(
+          "YouTube captions are unavailable for this video. To have AI automatically generate the full spoken script, summary, and chapters, please add your Gemini API key to .env (VITE_GEMINI_API_KEY).",
+        );
+        setLoading(false);
+        setAiLoading(false);
+        setTranscriptionState("failed");
+        return;
+      }
+
+      setLoading(true);
+      setAiLoading(true);
+      setError(null);
+      setTranscriptionState("loading");
+
+      try {
+        const fallbackResult = await generateAIScriptFallback(targetVideo);
+
+        const aiTranscript: Transcript = {
+          videoId: targetVideo.id || "unknown",
+          title: targetVideo.title,
+          language: "en",
+          source: "ai_generated",
+          duration: targetVideo.duration,
+          segments: fallbackResult.segments,
+        };
+
+        setTranscript(aiTranscript);
+        setSummary(fallbackResult.summary);
+        setChapters(fallbackResult.chapters);
+        setTranscriptionState("completed");
+        setError(null);
+
+        if (targetVideo.id) {
+          chrome.storage.local
+            .set({
+              [`transcript:${targetVideo.id}`]: aiTranscript,
+            })
+            .catch(() => {});
+        }
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? `AI Script generation failed: ${err.message}`
+            : "Failed to generate AI script.",
+        );
+        setTranscriptionState("failed");
+      } finally {
+        setLoading(false);
+        setAiLoading(false);
+      }
+    },
+    [],
   );
 
   const restoreTranscript = useCallback(
@@ -241,19 +292,10 @@ function App() {
       };
 
       if (!response?.success) {
-        throw new Error(
-          response?.error ??
-            "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
-        );
+        await handleAIFallbackScript(video);
       }
-    } catch (err) {
-      setLoading(false);
-      setTranscriptionState("failed");
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not retrieve transcript. Please verify the YouTube video is open.",
-      );
+    } catch {
+      await handleAIFallbackScript(video);
     }
   };
 
@@ -329,7 +371,9 @@ function App() {
   };
 
   const retryAI = () => {
-    if (transcript) {
+    if (transcript?.source === "ai_generated" && video) {
+      handleAIFallbackScript(video);
+    } else if (transcript) {
       populateAnalysis(transcript);
     }
   };
@@ -540,12 +584,16 @@ function App() {
           return;
         }
 
-        setError(
-          message.error ??
-            "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
-        );
-        setLoading(false);
-        setTranscriptionState("failed");
+        if (video) {
+          handleAIFallbackScript(video);
+        } else {
+          setError(
+            message.error ??
+              "YouTube captions are unavailable for this video. A full fallback transcription source is not currently available.",
+          );
+          setLoading(false);
+          setTranscriptionState("failed");
+        }
         return;
       }
     };
@@ -555,7 +603,7 @@ function App() {
     return () => {
       chrome.runtime.onMessage.removeListener(listener);
     };
-  }, [applyContext, loadActiveContext, populateAnalysis, video]);
+  }, [applyContext, handleAIFallbackScript, loadActiveContext, populateAnalysis, video]);
 
   useEffect(() => {
     if (!loading) {
@@ -703,7 +751,7 @@ function App() {
                   {loading ? (
                     <>
                       <div className="btn-spinner" />
-                      <span>{isSlowLoading ? "Still retrieving transcript..." : "Getting Transcript..."}</span>
+                      <span>{aiLoading ? "Generating AI Script & Analysis..." : isSlowLoading ? "Still retrieving transcript..." : "Getting Transcript..."}</span>
                     </>
                   ) : (
                     <span>🚀 Show Video Transcript & Analysis</span>
@@ -716,8 +764,8 @@ function App() {
               <div className="info-box processing-box">
                 <div className="spinner" />
                 <div>
-                  <strong>{isSlowLoading ? "Extracting full video audio..." : "Retrieving transcript..."}</strong>
-                  <p>Please wait a moment while we process the video content.</p>
+                  <strong>{aiLoading ? "AI is generating video script & analysis..." : isSlowLoading ? "Extracting full video audio..." : "Retrieving transcript..."}</strong>
+                  <p>{aiLoading ? "Gemini is analyzing the video content and constructing timestamped dialogue, summary, and chapters." : "Please wait a moment while we process the video content."}</p>
                 </div>
               </div>
             )}
@@ -876,6 +924,13 @@ function App() {
 
                 {activeTab === "transcript" && (
                   <div className="tab-pane">
+                    {transcript.source === "ai_generated" && (
+                      <div className="ai-source-banner">
+                        <span className="badge-ai-sparkle">✨</span>
+                        <span>AI Reconstructed Script (Generated via Gemini)</span>
+                      </div>
+                    )}
+
                     <div className="search-bar">
                       <span className="search-icon">🔍</span>
                       <input

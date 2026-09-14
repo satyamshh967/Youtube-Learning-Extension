@@ -36,10 +36,13 @@
       "matches": [
         "https://www.youtube.com/*"
       ],
+      "css": [
+        "hide-transcript.css"
+      ],
       "js": [
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ]
 }

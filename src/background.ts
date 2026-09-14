@@ -137,7 +137,6 @@ async function notifySidePanel(): Promise<void> {
   }
 }
 
-// Clicking toolbar icon opens side panel
 chrome.action.onClicked.addListener(async (tab) => {
   if (tab?.windowId) {
     await chrome.sidePanel.open({ windowId: tab.windowId });
@@ -229,7 +228,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         const videoId = context.video.id;
 
-        // Prevent duplicate concurrent requests for the same video
         if (inFlightTranscriptionVideoId === videoId) {
           sendResponse({ success: true, inFlight: true });
           return;
